@@ -5,6 +5,8 @@ import { z } from "zod";
 import { cache_read } from "./tools/cache_read.js";
 import { shell_cached } from "./tools/shell_cached.js";
 import { stats } from "./cache.js";
+import { IndexerService, getProjectIndex } from "./indexer/index.js";
+import { getGitState, formatGitState } from "./indexer/git.js";
 
 const server = new McpServer({
   name: "augment-cc",
@@ -38,6 +40,26 @@ server.tool(
   })
 );
 
+server.resource(
+  "project-index",
+  "project://index",
+  {
+    description:
+      "Compressed structural index of the current project: DB schema, API routes, TypeScript types, env vars, Docker services, and file tree. Built on server startup and updated incrementally via file watcher. Always includes live git state (branch, recent commits, modified files).",
+    mimeType: "text/markdown",
+  },
+  async (_uri) => {
+    const git = getGitState(process.cwd());
+    const indexMd = await getProjectIndex(process.cwd());
+    const gitBlock = formatGitState(git);
+    const text = [gitBlock, indexMd].filter(Boolean).join("\n\n")
+      || "<!-- Project index not yet built — retry in a moment -->";
+    return {
+      contents: [{ uri: "project://index", mimeType: "text/markdown", text }],
+    };
+  }
+);
+
 server.tool(
   "cache_stats",
   "Report cache hit statistics and entry counts.",
@@ -58,7 +80,10 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  // MCP servers communicate over stdio — no console.log here
+
+  new IndexerService(process.cwd()).start().catch((e) => {
+    process.stderr.write(`augment-cc indexer error: ${e}\n`);
+  });
 }
 
 main().catch((e) => {
