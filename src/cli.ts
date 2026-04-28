@@ -32,64 +32,7 @@ function meetsQualityThreshold(facts: TranscriptFacts): boolean {
   return true;
 }
 
-// ── LLM summarization ──────────────────────────────────────────────────────
-
-async function callHaikuSummarize(facts: TranscriptFacts): Promise<string | null> {
-  const apiKey = process.env["ANTHROPIC_API_KEY"];
-  if (!apiKey) return null;
-
-  const createdNames = facts.filesCreated.slice(0, 10).map(f => f.split("/").pop()).join(", ") || "none";
-  const modifiedNames = facts.filesModified.slice(0, 10).map(f => f.split("/").pop()).join(", ") || "none";
-
-  const prompt = [
-    `Generate a terse coding session summary (3-4 sentences) for an episodic memory system.`,
-    `Be specific: name files and technical choices. Note what's incomplete.`,
-    ``,
-    `Branch: ${facts.branch} | Duration: ${formatDuration(facts.durationSecs)}`,
-    `Task: "${facts.firstUserMessage}"`,
-    `Files created: ${createdNames}`,
-    `Files modified: ${modifiedNames}`,
-    `Commands: ${facts.commandsRun.slice(0, 5).join("; ") || "none"}`,
-    `Session ended with: "${facts.lastAssistantText}"`,
-  ].join("\n");
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      process.stderr.write(`augment-cc [summarize]: API error ${res.status}\n`);
-      return null;
-    }
-
-    const data = await res.json() as { content?: Array<{ type: string; text?: string }> };
-    return data.content?.find(b => b.type === "text")?.text?.trim() ?? null;
-  } catch (e) {
-    clearTimeout(timeout);
-    if ((e as Error).name === "AbortError") {
-      process.stderr.write("augment-cc [summarize]: API timeout\n");
-    } else {
-      process.stderr.write(`augment-cc [summarize]: fetch error: ${e}\n`);
-    }
-    return null;
-  }
-}
+// ── summarization ──────────────────────────────────────────────────────────
 
 function buildStructuredSummary(facts: TranscriptFacts): string {
   const parts: string[] = [];
@@ -226,8 +169,8 @@ async function runSummarize(): Promise<void> {
     process.exit(0);
   }
 
-  // 5. Summarize (LLM with structured fallback)
-  const summary = (await callHaikuSummarize(facts)) ?? buildStructuredSummary(facts);
+  // 5. Summarize via structured extraction
+  const summary = buildStructuredSummary(facts);
 
   // 6. Persist
   initIndexDb();
