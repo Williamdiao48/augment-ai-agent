@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.js.map
+*.d.ts
+
+# local planning docs
+ROADMAP.md
+
+# cache
+.cache/
+
+# env
+.env
+.env.local
