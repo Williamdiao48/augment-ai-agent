@@ -41,6 +41,14 @@ export function initIndexDb(): void {
 
     CREATE INDEX IF NOT EXISTS sessions_by_project
       ON sessions (project_root, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS session_reads (
+      session_id    TEXT NOT NULL,
+      file_path     TEXT NOT NULL,
+      content_hash  TEXT NOT NULL,
+      first_read_at INTEGER NOT NULL,
+      PRIMARY KEY (session_id, file_path)
+    );
   `);
 }
 
@@ -156,6 +164,28 @@ export function pruneOldSessions(projectRoot: string, maxSessions: number): void
         )
     `)
     .run(projectRoot, projectRoot, maxSessions);
+}
+
+export function hasBeenRead(sessionId: string, filePath: string): { content_hash: string } | null {
+  const row = getDb()
+    .prepare("SELECT content_hash FROM session_reads WHERE session_id = ? AND file_path = ?")
+    .get(sessionId, filePath) as { content_hash: string } | undefined;
+  return row ?? null;
+}
+
+export function recordRead(sessionId: string, filePath: string, contentHash: string): void {
+  getDb()
+    .prepare(`
+      INSERT OR IGNORE INTO session_reads (session_id, file_path, content_hash, first_read_at)
+      VALUES (?, ?, ?, ?)
+    `)
+    .run(sessionId, filePath, contentHash, Date.now());
+}
+
+export function pruneOldSessionReads(maxAgeMs: number = 48 * 3600 * 1000): void {
+  getDb()
+    .prepare("DELETE FROM session_reads WHERE first_read_at < ?")
+    .run(Date.now() - maxAgeMs);
 }
 
 function safeJsonParse(s: string): string[] {

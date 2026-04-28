@@ -7,6 +7,9 @@ import { shell_cached } from "./tools/shell_cached.js";
 import { stats } from "./cache.js";
 import { IndexerService, getProjectIndex } from "./indexer/index.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
+import { initIndexDb, pruneOldSessionReads } from "./indexer/db.js";
+
+const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
 const server = new McpServer({
   name: "augment-cc",
@@ -22,7 +25,7 @@ server.tool(
     project_root: z.string().optional().describe("Project root for resolving relative paths"),
   },
   async (args) => ({
-    content: [{ type: "text", text: await cache_read(args) }],
+    content: [{ type: "text", text: await cache_read({ ...args, _sessionId: SESSION_ID }) }],
   })
 );
 
@@ -83,6 +86,9 @@ async function main() {
     await runCli(process.argv);
     process.exit(0);
   }
+
+  initIndexDb();
+  pruneOldSessionReads();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

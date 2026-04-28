@@ -1,6 +1,7 @@
 import { readFileSync, statSync } from "fs";
-import { resolve } from "path";
+import { resolve, basename } from "path";
 import { hashContent, get, set } from "../cache.js";
+import { hasBeenRead, recordRead } from "../indexer/db.js";
 
 export const cache_read_schema = {
   name: "cache_read",
@@ -30,9 +31,18 @@ export async function cache_read(args: {
   path: string;
   max_lines?: number;
   project_root?: string;
+  _sessionId?: string;
 }): Promise<string> {
   const absPath = resolve(args.project_root ?? process.cwd(), args.path);
   const maxLines = args.max_lines ?? 500;
+
+  // Session-level dedup: skip disk read entirely if already in context
+  if (args._sessionId) {
+    const prior = hasBeenRead(args._sessionId, absPath);
+    if (prior) {
+      return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. Content is already in your context; reading again wastes tokens.]`;
+    }
+  }
 
   let stat: ReturnType<typeof statSync>;
   try {
@@ -69,6 +79,8 @@ export async function cache_read(args: {
 
   const result = output + summary;
   set(cacheKey, result, { contentHash: currentHash });
+
+  if (args._sessionId) recordRead(args._sessionId, absPath, currentHash);
 
   return result;
 }

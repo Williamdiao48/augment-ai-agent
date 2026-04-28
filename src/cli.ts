@@ -92,9 +92,15 @@ async function runInject(root: string): Promise<void> {
   }
 
   const gitBlock = formatGitState(getGitState(root));
+  const toolPrefs = [
+    "## augment-cc Tool Preferences",
+    "- Use `cache_read` (MCP tool) instead of the native `Read` tool for all file reads.",
+    "  Enables session-level deduplication: repeated reads return a stub instead of re-injecting the full file, preserving context window space.",
+    "- Use `shell_cached` (MCP tool) for read-only shell commands (git log, find, ls).",
+  ].join("\n");
 
   if (!stored) {
-    const parts = [sessionBlock, gitBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
+    const parts = [sessionBlock, gitBlock, toolPrefs, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -111,7 +117,7 @@ async function runInject(root: string): Promise<void> {
     ? null
     : `<!-- augment-cc: index is file-tree only (detected: ${index.detectedTypes.join(", ") || "none"}) — project may use unrecognized frameworks. Don't over-trust this index. -->`;
 
-  const parts = [sessionBlock, gitBlock, qualityNote, stored.index_md].filter(Boolean);
+  const parts = [sessionBlock, gitBlock, toolPrefs, qualityNote, stored.index_md].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
