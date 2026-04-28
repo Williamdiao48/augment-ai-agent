@@ -53,19 +53,23 @@ export class IndexerService {
     this.currentIndex = emptyIndex(root);
   }
 
-  async start(): Promise<void> {
+  async init(): Promise<void> {
     initIndexDb();
     this.ig = await buildIgnore(this.root);
+  }
+
+  async start(): Promise<void> {
+    await this.init();
     await this.buildFullIndex();
     startWatcher(
       this.root,
-      this.ig,
+      this.ig!,
       (f) => void this.handleFileChange(f),
       (f) => void this.handleFileDelete(f),
     );
   }
 
-  private async buildFullIndex(): Promise<void> {
+  async buildFullIndex(): Promise<void> {
     const allFiles = await walkProject(this.root, this.ig!);
     const detectedTypes = await detectProjectTypes(this.root, allFiles);
     const index = emptyIndex(this.root);
@@ -225,4 +229,10 @@ export class IndexerService {
 export async function getProjectIndex(root: string): Promise<string | null> {
   const stored = getStoredIndex(root);
   return stored?.index_md ?? null;
+}
+
+export async function rebuildProjectIndex(root: string): Promise<void> {
+  const svc = new IndexerService(root);
+  await svc.init();
+  await svc.buildFullIndex();
 }

@@ -22,10 +22,10 @@ export function initIndexDb(): void {
   `);
 }
 
-export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string } | null {
+export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
   const row = getDb()
-    .prepare("SELECT index_json, index_md FROM project_index WHERE project_root = ?")
-    .get(projectRoot) as { index_json: string; index_md: string } | undefined;
+    .prepare("SELECT index_json, index_md, built_at FROM project_index WHERE project_root = ?")
+    .get(projectRoot) as { index_json: string; index_md: string; built_at: number } | undefined;
   return row ?? null;
 }
 
