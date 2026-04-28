@@ -162,3 +162,37 @@ export interface ProjectIndex {
   fileTree: FileTreeSummary;
   builtAt: number;
 }
+
+// Intermediate — extracted from JSONL transcript, not persisted
+export interface TranscriptFacts {
+  sessionId: string;
+  projectRoot: string;
+  branch: string;
+  startedAt: number;
+  endedAt: number;
+  durationSecs: number;
+  firstUserMessage: string;
+  lastAssistantText: string;
+  filesCreated: string[];
+  filesModified: string[];
+  commandsRun: string[];
+  messageCount: number;
+  aiTitle: string | null;
+}
+
+// Persisted in SQLite `sessions` table
+export interface SessionEntry {
+  sessionId: string;
+  projectRoot: string;
+  startedAt: number;
+  endedAt: number;
+  durationSecs: number;
+  branch: string;
+  summary: string;
+  filesCreated: string[];
+  filesModified: string[];
+  commandsRun: string[];
+  messageCount: number;
+  aiTitle: string | null;
+  createdAt: number;
+}
