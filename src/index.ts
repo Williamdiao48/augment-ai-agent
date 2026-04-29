@@ -21,8 +21,10 @@ server.tool(
   "Read a file with content-hash caching. Returns cached result if file hasn't changed, avoiding redundant reads that bloat context.",
   {
     path: z.string().describe("Absolute or relative path to the file"),
-    max_lines: z.number().optional().describe("Truncate to this many lines (default: 500)"),
+    max_lines: z.number().optional().describe("Truncate to this many lines (default: 500). Ignored when keyword is set."),
     project_root: z.string().optional().describe("Project root for resolving relative paths"),
+    keyword: z.string().optional().describe("Return only lines containing this term plus surrounding context. Use when you know what you're looking for — saves context vs reading the full file."),
+    context_lines: z.number().optional().describe("Lines of context around each keyword match (default: 10)"),
   },
   async (args) => ({
     content: [{ type: "text", text: await cache_read({ ...args, _sessionId: SESSION_ID }) }],

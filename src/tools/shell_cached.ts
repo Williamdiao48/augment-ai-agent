@@ -1,6 +1,58 @@
 import { execSync } from "child_process";
 import { get, set } from "../cache.js";
 
+// ── Output filters ─────────────────────────────────────────────────────────
+
+function stripAnsi(s: string): string {
+  return s.replace(/\x1b\[[0-9;]*[mGKHF]/g, "");
+}
+
+function stripGitPatchHunks(output: string): string {
+  // Split into commit blocks, strip diff content from each, keep metadata
+  const blocks = output.split(/(?=^commit )/m);
+  return blocks.map(block => {
+    const lines = block.split("\n");
+    let inDiff = false;
+    let hadHunks = false;
+    const kept: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("diff --git") || line.startsWith("index ")) {
+        inDiff = true;
+        hadHunks = true;
+        continue;
+      }
+      if (inDiff && /^(\+\+\+|---|@@|[+-])/.test(line)) continue;
+      if (inDiff && line === "") { inDiff = false; }
+      kept.push(line);
+    }
+    if (hadHunks) kept.push("[diff hunks stripped — use git show <hash> for full patch]");
+    return kept.join("\n");
+  }).join("");
+}
+
+function stripPackageManagerNoise(output: string): string {
+  const NOISE_RE = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|^(added|removed|changed|audited|found) \d+|^npm warn deprecated|^npm (WARN )?progress/i;
+  const KEEP_RE = /error|ERR!|warn(?!.*deprecated)|vulnerabilit/i;
+  const filtered = output
+    .split("\n")
+    .filter(line => KEEP_RE.test(line) || !NOISE_RE.test(line))
+    .join("\n");
+  return filtered.trim() ? filtered : output;
+}
+
+type FilterFn = (output: string) => string;
+const COMMAND_FILTERS: Array<{ pattern: RegExp; filter: FilterFn }> = [
+  { pattern: /git\s+log\s+.*(--patch|-p)\b/, filter: stripGitPatchHunks },
+  { pattern: /\b(npm|yarn|pnpm)\s+(install|ci|add)\b/, filter: stripPackageManagerNoise },
+];
+
+function applyCommandFilter(command: string, output: string): string {
+  for (const { pattern, filter } of COMMAND_FILTERS) {
+    if (pattern.test(command)) return filter(output);
+  }
+  return output;
+}
+
 // TTL presets for common command patterns (ms)
 const TTL_PRESETS: Array<[RegExp, number]> = [
   [/^git\s+log/, 30_000],          // git log: 30s
@@ -81,6 +133,9 @@ export async function shell_cached(args: {
     const err = e as { stdout?: string; stderr?: string; message?: string };
     output = err.stdout ?? err.stderr ?? err.message ?? String(e);
   }
+
+  output = stripAnsi(output);
+  output = applyCommandFilter(args.command, output);
 
   const truncated = output.length > maxChars;
   const result = truncated
