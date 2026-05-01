@@ -50,6 +50,12 @@ export function initIndexDb(): void {
       PRIMARY KEY (session_id, file_path)
     );
   `);
+
+  // Phase 7 migration: add read tracking columns if not present
+  try {
+    db.exec("ALTER TABLE session_reads ADD COLUMN read_count INTEGER NOT NULL DEFAULT 1");
+    db.exec("ALTER TABLE session_reads ADD COLUMN last_read_at INTEGER NOT NULL DEFAULT 0");
+  } catch { /* columns already exist */ }
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -166,20 +172,41 @@ export function pruneOldSessions(projectRoot: string, maxSessions: number): void
     .run(projectRoot, projectRoot, maxSessions);
 }
 
-export function hasBeenRead(sessionId: string, filePath: string): { content_hash: string } | null {
+export function hasBeenRead(sessionId: string, filePath: string): { content_hash: string; read_count: number } | null {
   const row = getDb()
-    .prepare("SELECT content_hash FROM session_reads WHERE session_id = ? AND file_path = ?")
-    .get(sessionId, filePath) as { content_hash: string } | undefined;
+    .prepare("SELECT content_hash, read_count FROM session_reads WHERE session_id = ? AND file_path = ?")
+    .get(sessionId, filePath) as { content_hash: string; read_count: number } | undefined;
   return row ?? null;
 }
 
 export function recordRead(sessionId: string, filePath: string, contentHash: string): void {
+  const now = Date.now();
   getDb()
     .prepare(`
-      INSERT OR IGNORE INTO session_reads (session_id, file_path, content_hash, first_read_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO session_reads (session_id, file_path, content_hash, read_count, first_read_at, last_read_at)
+      VALUES (?, ?, ?, 1, ?, ?)
+      ON CONFLICT(session_id, file_path) DO UPDATE SET
+        read_count = read_count + 1,
+        last_read_at = excluded.last_read_at
     `)
-    .run(sessionId, filePath, contentHash, Date.now());
+    .run(sessionId, filePath, contentHash, now, now);
+}
+
+export function getTopReadFiles(projectRoot: string, limit: number = 5): Array<{ file_path: string; session_count: number; total_reads: number }> {
+  type Row = { file_path: string; session_count: number; total_reads: number };
+  return getDb()
+    .prepare(`
+      SELECT sr.file_path,
+             COUNT(DISTINCT sr.session_id) AS session_count,
+             SUM(sr.read_count)            AS total_reads
+      FROM session_reads sr
+      JOIN sessions s ON sr.session_id = s.session_id
+      WHERE s.project_root = ?
+      GROUP BY sr.file_path
+      ORDER BY session_count DESC, total_reads DESC
+      LIMIT ?
+    `)
+    .all(projectRoot, limit) as Row[];
 }
 
 export function pruneOldSessionReads(maxAgeMs: number = 48 * 3600 * 1000): void {

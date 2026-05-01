@@ -3,6 +3,8 @@ import { resolve, basename } from "path";
 import { hashContent, get, set } from "../cache.js";
 import { hasBeenRead, recordRead } from "../indexer/db.js";
 
+const WATCHDOG_THRESHOLD = Number(process.env.AUGMENT_CC_WATCHDOG_THRESHOLD ?? 3);
+
 // ── Keyword excerpt ────────────────────────────────────────────────────────
 
 function mergeWindows(windows: number[][]): number[][] {
@@ -85,10 +87,28 @@ export async function cache_read(args: {
   const absPath = resolve(args.project_root ?? process.cwd(), args.path);
   const maxLines = args.max_lines ?? 500;
 
-  // Session-level dedup: skip disk read entirely if already in context
+  // Session-level dedup + compaction watchdog
   if (args._sessionId) {
     const prior = hasBeenRead(args._sessionId, absPath);
     if (prior) {
+      recordRead(args._sessionId, absPath, prior.content_hash);
+      const newCount = prior.read_count + 1;
+
+      if (newCount % WATCHDOG_THRESHOLD === 0) {
+        let content: string;
+        try {
+          const raw = readFileSync(absPath, "utf-8");
+          const lines = raw.split("\n");
+          const maxLines = args.max_lines ?? 500;
+          const truncated = lines.length > maxLines;
+          content = lines.slice(0, maxLines).join("\n") +
+            (truncated ? `\n[truncated: showing ${maxLines}/${lines.length} lines]` : "");
+        } catch {
+          content = "[augment-cc: could not re-read file — it may have been deleted or moved]";
+        }
+        return `[augment-cc: compaction watchdog — ${basename(absPath)} has been requested ${newCount} times this session. Refreshing content to restore context.]\n\n${content}`;
+      }
+
       return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. Content is already in your context; reading again wastes tokens.]`;
     }
   }

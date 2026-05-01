@@ -1,6 +1,6 @@
 import { resolve, join } from "path";
 import os from "os";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles } from "./indexer/db.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
 import { parseTranscript } from "./indexer/transcript.js";
@@ -52,6 +52,22 @@ function buildStructuredSummary(facts: TranscriptFacts): string {
   return parts.join(" ");
 }
 
+// ── high-value files formatter ─────────────────────────────────────────────
+
+function formatHighValueFiles(files: Array<{ file_path: string; session_count: number; total_reads: number }>): string | null {
+  if (files.length === 0) return null;
+  const lines = ["## High-value Files (historically frequent reads)", ""];
+  for (const f of files) {
+    const name = f.file_path.split("/").pop() ?? f.file_path;
+    const sessPlural = f.session_count === 1 ? "session" : "sessions";
+    lines.push(`- \`${name}\` — read in ${f.session_count} ${sessPlural}, ${f.total_reads} total reads`);
+    lines.push(`  Path: ${f.file_path}`);
+  }
+  lines.push("");
+  lines.push("Consider reading these early and keeping their key details in mind — compaction is more likely to drop them.");
+  return lines.join("\n");
+}
+
 // ── session formatter ──────────────────────────────────────────────────────
 
 function formatSessions(sessions: SessionEntry[]): string | null {
@@ -98,9 +114,10 @@ async function runInject(root: string): Promise<void> {
     "  Enables session-level deduplication: repeated reads return a stub instead of re-injecting the full file, preserving context window space.",
     "- Use `shell_cached` (MCP tool) for read-only shell commands (git log, find, ls).",
   ].join("\n");
+  const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
 
   if (!stored) {
-    const parts = [sessionBlock, gitBlock, toolPrefs, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
+    const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -117,7 +134,7 @@ async function runInject(root: string): Promise<void> {
     ? null
     : `<!-- augment-cc: index is file-tree only (detected: ${index.detectedTypes.join(", ") || "none"}) — project may use unrecognized frameworks. Don't over-trust this index. -->`;
 
-  const parts = [sessionBlock, gitBlock, toolPrefs, qualityNote, stored.index_md].filter(Boolean);
+  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote, stored.index_md].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
