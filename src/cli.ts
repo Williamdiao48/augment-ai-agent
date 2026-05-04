@@ -1,6 +1,8 @@
-import { resolve, join } from "path";
+import { resolve, join, dirname } from "path";
 import os from "os";
+import { realpathSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles } from "./indexer/db.js";
+import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
 import { parseTranscript } from "./indexer/transcript.js";
@@ -218,12 +220,215 @@ async function runSummarize(): Promise<void> {
   process.exit(0);
 }
 
+// ── hook config checker ────────────────────────────────────────────────────
+
+interface HookConfig {
+  hasMcp: boolean;
+  hasClaudeMd: boolean;
+  hasStopHook: boolean;
+}
+
+function checkHookConfig(root: string): HookConfig {
+  // .mcp.json
+  let hasMcp = false;
+  try {
+    const mcp = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf-8")) as Record<string, unknown>;
+    const servers = (mcp.mcpServers ?? {}) as Record<string, unknown>;
+    hasMcp = "augment-cc" in servers;
+  } catch { /* missing or unreadable */ }
+
+  // CLAUDE.md
+  let hasClaudeMd = false;
+  try {
+    const md = readFileSync(join(root, "CLAUDE.md"), "utf-8");
+    hasClaudeMd = md.includes("augment-cc inject") || md.includes("dist/index.js inject");
+  } catch { /* missing */ }
+
+  // ~/.claude/settings.json Stop hook
+  let hasStopHook = false;
+  try {
+    const settingsPath = join(os.homedir(), ".claude", "settings.json");
+    const settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+    const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
+    const stopHooks = (Array.isArray(hooks.Stop) ? hooks.Stop : []) as unknown[];
+    hasStopHook = stopHooks.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && (cmd.includes("augment-cc summarize") || (cmd.includes("dist/index.js") && cmd.includes("summarize")));
+      });
+    });
+  } catch { /* missing */ }
+
+  return { hasMcp, hasClaudeMd, hasStopHook };
+}
+
+// ── init ───────────────────────────────────────────────────────────────────
+
+async function runInit(root: string): Promise<void> {
+  initIndexDb();
+  const binPath = realpathSync(process.argv[1]);
+  const results: string[] = [];
+
+  // 1. .mcp.json
+  const mcpPath = join(root, ".mcp.json");
+  let mcpJson: Record<string, unknown> = {};
+  let mcpExists = false;
+  try {
+    mcpJson = JSON.parse(readFileSync(mcpPath, "utf-8")) as Record<string, unknown>;
+    mcpExists = true;
+  } catch { /* will create fresh */ }
+
+  const servers = ((mcpJson.mcpServers ?? {}) as Record<string, unknown>);
+  if ("augment-cc" in servers) {
+    results.push("  [skip] .mcp.json already configured");
+  } else {
+    servers["augment-cc"] = { type: "stdio", command: "node", args: [binPath], env: {} };
+    mcpJson.mcpServers = servers;
+    writeFileSync(mcpPath, JSON.stringify(mcpJson, null, 2));
+    results.push(`  [done] .mcp.json ${mcpExists ? "updated" : "created"}`);
+  }
+
+  // 2. CLAUDE.md
+  const claudeMdPath = join(root, "CLAUDE.md");
+  const injectLine = `!node ${binPath} inject --project-root $PWD`;
+  let claudeMdExists = false;
+  let claudeMdContent = "";
+  try {
+    claudeMdContent = readFileSync(claudeMdPath, "utf-8");
+    claudeMdExists = true;
+  } catch { /* will create */ }
+
+  if (claudeMdContent.includes("augment-cc inject") || claudeMdContent.includes("dist/index.js inject")) {
+    results.push("  [skip] CLAUDE.md already configured");
+  } else if (claudeMdExists) {
+    writeFileSync(claudeMdPath, injectLine + "\n\n" + claudeMdContent);
+    results.push("  [done] CLAUDE.md updated (inject line prepended)");
+  } else {
+    writeFileSync(claudeMdPath, injectLine + "\n");
+    results.push("  [done] CLAUDE.md created");
+  }
+
+  // 3. ~/.claude/settings.json Stop hook
+  const settingsPath = join(os.homedir(), ".claude", "settings.json");
+  let settings: Record<string, unknown> = {};
+  try {
+    settings = JSON.parse(readFileSync(settingsPath, "utf-8")) as Record<string, unknown>;
+  } catch { /* missing or empty */ }
+
+  const hooks = (settings.hooks ?? (settings.hooks = {})) as Record<string, unknown>;
+  if (!Array.isArray(hooks.Stop)) hooks.Stop = [];
+  const stopHooks = hooks.Stop as unknown[];
+
+  const alreadyWired = stopHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+    return inner?.some(h => {
+      const cmd = h.command as string | undefined;
+      return typeof cmd === "string" && (cmd.includes("augment-cc summarize") || (cmd.includes("dist/index.js") && cmd.includes("summarize")));
+    });
+  });
+
+  if (alreadyWired) {
+    results.push("  [skip] Stop hook already configured");
+  } else {
+    stopHooks.push({ matcher: "", hooks: [{ type: "command", command: `node ${binPath} summarize` }] });
+    mkdirSync(dirname(settingsPath), { recursive: true });
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+    results.push("  [done] Stop hook added to ~/.claude/settings.json");
+  }
+
+  // 4. First index build
+  process.stderr.write("augment-cc: building initial project index...\n");
+  await rebuildProjectIndex(root);
+
+  // 5. Report
+  const stored = getStoredIndex(root);
+  const fileCount = stored ? (JSON.parse(stored.index_json) as Record<string, unknown>) : null;
+  results.push(`  [done] Project index built`);
+
+  process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
+}
+
+// ── status ─────────────────────────────────────────────────────────────────
+
+function runStatus(root: string): void {
+  initIndexDb();
+
+  const cacheStats = stats();
+  const sessions = getRecentSessions(root, 1);
+  const topFiles = getTopReadFiles(root, 3);
+  const hookConfig = checkHookConfig(root);
+
+  const lines: string[] = [`augment-cc status — ${root}`, ""];
+
+  // Cache
+  lines.push("Cache");
+  lines.push(`  Total entries:  ${cacheStats.total}`);
+  lines.push(`  Expired:        ${cacheStats.expired}`);
+  lines.push("");
+
+  // Sessions
+  lines.push("Sessions (this project)");
+  const sessionCount = getRecentSessions(root, 100).length;
+  if (sessions.length === 0) {
+    lines.push("  No sessions recorded yet");
+  } else {
+    lines.push(`  Recorded:       ${sessionCount}`);
+    const s = sessions[0];
+    const date = new Date(s.startedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+    const dur = formatDuration(s.durationSecs);
+    const title = s.aiTitle ? ` — ${s.aiTitle}` : "";
+    lines.push(`  Most recent:    ${date}${title} (${dur} on \`${s.branch}\`)`);
+  }
+  lines.push("");
+
+  // High-value files
+  lines.push("High-value files");
+  if (topFiles.length === 0) {
+    lines.push("  None yet (accumulates across sessions)");
+  } else {
+    for (const f of topFiles) {
+      const name = (f.file_path.split("/").pop() ?? f.file_path).padEnd(24);
+      const sessStr = `${f.session_count} session${f.session_count === 1 ? "" : "s"}`;
+      lines.push(`  ${name}  ${sessStr}, ${f.total_reads} total reads`);
+    }
+  }
+  lines.push("");
+
+  // Hooks
+  lines.push("Hooks");
+  const tick = (ok: boolean) => ok ? "✓" : "✗";
+  lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc init"}`);
+  lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc init"}`);
+  lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc init"}`);
+
+  process.stdout.write(lines.join("\n") + "\n");
+}
+
+// ── CLI commands ───────────────────────────────────────────────────────────
+
 export async function runCli(argv: string[]): Promise<void> {
   const command = argv[2];
   const root = parseProjectRoot(argv);
+  if (command === "init") return runInit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
   if (command === "summarize") return runSummarize();
-  process.stderr.write(`augment-cc: unknown command "${command}"\nUsage: augment-cc inject|refresh|summarize [--project-root <path>]\n`);
+  if (command === "status") return runStatus(root);
+  process.stderr.write([
+    `augment-cc: unknown command "${command}"`,
+    "",
+    "Usage: augment-cc <command> [--project-root <path>]",
+    "",
+    "Commands:",
+    "  init       Set up augment-cc in the current project",
+    "  inject     Print context injection block (used by CLAUDE.md hook)",
+    "  refresh    Force-rebuild the project index",
+    "  summarize  Parse session transcript and save summary (used by Stop hook)",
+    "  status     Show cache stats, session history, and hook configuration",
+    "",
+  ].join("\n"));
   process.exit(1);
 }

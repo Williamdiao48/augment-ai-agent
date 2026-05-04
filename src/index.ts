@@ -83,7 +83,7 @@ server.tool(
 );
 
 async function main() {
-  if (process.argv[2] === "inject" || process.argv[2] === "refresh" || process.argv[2] === "summarize") {
+  if (process.argv[2]) {
     const { runCli } = await import("./cli.js");
     await runCli(process.argv);
     process.exit(0);
