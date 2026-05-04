@@ -68,21 +68,29 @@ The headline numbers: dedup saves 99.8% of re-read chars (69K → 149 byte stub)
 
 ## Setup
 
-### 1. Build from source
+### 1. Install globally (one-time)
 
 ```bash
 git clone <this-repo>
 cd augment-cc
-npm install
-npm run build
+npm install && npm run build && npm link
 ```
 
-### 2. Initialize in your project
+`npm link` registers `augment-cc` as a global command pointing at the local build. After this step you never touch the clone again.
 
-Run this once per project you want to augment. From the project directory:
+> **Permission error on `npm link`?** Your global node install may be owned by root. Either `sudo npm link`, or configure a user-level npm prefix (recommended — no sudo ever again):
+> ```bash
+> mkdir -p ~/.npm-global
+> npm config set prefix '~/.npm-global'
+> echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+> npm link
+> ```
+
+### 2. Initialize in any project (one command)
 
 ```bash
-node /path/to/augment-cc/dist/index.js init
+cd /your-project
+augment-cc init
 ```
 
 This does three things automatically:
@@ -123,10 +131,10 @@ The MCP server connects on startup. Restart Claude Code (or the extension host) 
 ### 4. Verify
 
 ```bash
-node /path/to/augment-cc/dist/index.js status
+augment-cc status
 ```
 
-All three hooks should show `✓`. If any show `✗`, re-run `init`.
+All three hooks should show `✓`. If any show `✗`, re-run `augment-cc init`.
 
 ---
 
@@ -155,7 +163,7 @@ To get this benefit on an existing project you're already working in:
 
 ```bash
 # From your project directory
-node /path/to/augment-cc/dist/index.js init
+augment-cc init
 
 # Restart Claude Code, then continue your session as normal
 # augment-cc will handle dedup and watchdog transparently
@@ -177,12 +185,12 @@ augment-cc <command> [--project-root <path>]
 
 ```bash
 # Force a fresh index build (e.g. after adding new files)
-node dist/index.js refresh
+augment-cc refresh
 
 # Check what's been recorded
-node dist/index.js status
+augment-cc status
 
-# Run the benchmark
+# Run the benchmark (from the augment-cc repo)
 npm run benchmark
 ```
 
@@ -237,18 +245,9 @@ All via environment variables (set in `.mcp.json` `env` block or shell):
 | `AUGMENT_CC_STALE_MS` | `3600000` (1h) | Age at which the project index is considered stale |
 | `AUGMENT_CC_MAX_SESSIONS` | `10` | Sessions to retain per project |
 
-To lower the watchdog threshold for very long sessions (more aggressive refresh):
+To lower the watchdog threshold for very long sessions (more aggressive refresh), edit the `env` block in your project's `.mcp.json`:
 ```json
-{
-  "mcpServers": {
-    "augment-cc": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/path/to/dist/index.js"],
-      "env": { "AUGMENT_CC_WATCHDOG_THRESHOLD": "2" }
-    }
-  }
-}
+"env": { "AUGMENT_CC_WATCHDOG_THRESHOLD": "2" }
 ```
 
 ---
