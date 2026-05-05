@@ -175,6 +175,49 @@ row("git log --patch (raw)",      0,         rawPatch.length,      "diff hunks p
 row("git log --patch (filtered)", s5filtered.ms, s5filtered.out.length, `${filterPct}% smaller — hunks stripped`);
 console.log(`  chars avoided by filter chain: ${fmt(filterSaved)}\n`);
 
+// ══ Scenario 6: mtime fast-path ══════════════════════════════
+console.log("Scenario 6  mtime Fast-Path (skip readFileSync on warm reads)");
+console.log(line);
+
+// Use a dedicated session so there's no dedup stub interference
+const sid6 = newSid();
+const file6 = "src/cache.ts";
+invalidate(`file:${resolve(ROOT, file6)}`);
+
+// Cold: no cache entry — full disk read + hash + store mtime
+const s6cold = await timed(() => cache_read({ path: file6, project_root: ROOT, _sessionId: sid6 }));
+
+// Warm (new session to bypass dedup): mtime matches → skip readFileSync entirely
+const s6warm = await timed(() => cache_read({ path: file6, project_root: ROOT, _sessionId: newSid() }));
+
+row(`cold read    ${file6}`, s6cold.ms, s6cold.out.length, "cache miss — stat + read + hash + store");
+row(`warm read    ${file6}`, s6warm.ms, s6warm.out.length, `mtime hit — stat only, no readFileSync`);
+console.log(`  note: mtime fast-path avoids readFileSync on unchanged files — benefits large files most\n`);
+
+// ══ Scenario 7: Dense keyword search ═════════════════════════
+console.log("Scenario 7  Dense Keyword Search (sampled mode)");
+console.log(line);
+
+// "export" appears on nearly every line of the fixture — triggers dense/sampled mode
+const r7dense = await timed(() =>
+  cache_read({ path: FIXTURE_PATH, _sessionId: newSid(), keyword: "export", context_lines: 3 })
+);
+// "ApiModel50" appears on ~4 lines — sparse, normal mode
+const r7sparse = await timed(() =>
+  cache_read({ path: FIXTURE_PATH, _sessionId: newSid(), keyword: "ApiModel50", context_lines: 2 })
+);
+
+const denseIsSampled = r7dense.out.includes("is dense");
+const sparseIsNormal = !r7sparse.out.includes("is dense");
+const denseReduction  = Math.round((1 - r7dense.out.length  / 69655) * 100);
+const sparseReduction = Math.round((1 - r7sparse.out.length / 69655) * 100);
+const kwSaved7 = Math.max(0, 69655 - r7sparse.out.length);
+charsAvoided += kwSaved7;
+
+row(`keyword "export"  fixture (dense)`,    r7dense.ms,  r7dense.out.length,  denseIsSampled  ? `sampled mode — ${denseReduction}% smaller` : "unexpected");
+row(`keyword "ApiModel50"  fixture (sparse)`, r7sparse.ms, r7sparse.out.length, sparseIsNormal ? `normal mode — ${sparseReduction}% smaller` : "unexpected");
+console.log(`  chars avoided by targeted sparse search: ${fmt(kwSaved7)}\n`);
+
 // cleanup
 unlinkSync(FIXTURE_PATH);
 

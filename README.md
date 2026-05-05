@@ -8,16 +8,18 @@ Built for heavy Claude Code usage where context compaction is a real constraint.
 
 ## What it does
 
-Four things, each solving a specific failure mode in long sessions:
-
 | Feature | Problem solved |
 |---|---|
 | **File read cache** | Same file read twice in one session re-injects the full content — burning context |
+| **mtime fast-path** | Warm cache hits skip `readFileSync` entirely — stat-only check on unchanged files |
 | **Session dedup** | After compaction, Claude reaches for files it already read — dedup returns a stub instead |
 | **Compaction watchdog** | If a file is re-read 3× in a session, the context was probably compacted — refresh it automatically |
 | **Shell output filters** | `git log --patch` dumps thousands of diff lines — strip hunks, keep commit metadata |
+| **Dense keyword handling** | Search terms that appear on every line collapse into a giant blob — sampled mode shows 10 evenly-spaced regions instead |
 | **Project index** | Every session starts cold on project structure — inject a structural snapshot at session start |
+| **Polyglot indexer** | JS/TS projects got deep extraction; Python, Go, Rust, Java, etc. got file-tree only — now all languages get symbol-level extraction |
 | **Session memory** | Prior sessions are summarized and injected on next start — Claude knows what changed last time |
+| **Decision extraction** | Session summaries capture *why* decisions were made, not just *what* changed — injected as "Key decisions" on next start |
 
 ---
 
@@ -32,8 +34,8 @@ Scenario 1  File Read Caching (content-hash cache)
   note: content cache ensures stable output across sessions; primary token savings come from dedup (scenario 2)
 
 Scenario 2  Session Deduplication + Compaction Watchdog
-  read 1  fixture (498 lines)                     2 ms     69,655 chars   full content
-  read 2  fixture (same session)                  1 ms        149 chars   dedup stub ← context saved
+  read 1  fixture (498 lines)                     1 ms     69,655 chars   full content
+  read 2  fixture (same session)                 <1 ms        149 chars   dedup stub ← context saved
   read 3  fixture (same session)                  1 ms     69,800 chars   watchdog REFRESH ← compaction guard
   chars avoided by dedup stub: 69,506
 
@@ -43,26 +45,36 @@ Scenario 3  Keyword Excerpt Search
   chars avoided by targeted search: 68,295
 
 Scenario 4  Shell Command Caching (TTL cache)
-  git status (fresh)                             28 ms        423 chars   10s TTL
-  git status (cached)                            <1 ms        432 chars   cache hit — >28× faster
+  git status (fresh)                             21 ms        418 chars   10s TTL
+  git status (cached)                            <1 ms        427 chars   cache hit — >21× faster
 
-  git log --oneline -10 (fresh)                  21 ms        661 chars   30s TTL
-  git log --oneline -10 (cached)                 <1 ms        670 chars   cache hit — >21× faster
+  git log --oneline -10 (fresh)                  20 ms        783 chars   30s TTL
+  git log --oneline -10 (cached)                 <1 ms        792 chars   cache hit — >20× faster
 
 Scenario 5  Output Filter Chain (patch hunk stripping)
-  git log --patch (raw)                          <1 ms     10,449 chars   diff hunks present
-  git log --patch (filtered)                     18 ms      1,055 chars   90% smaller — hunks stripped
-  chars avoided by filter chain: 9,394
+  git log --patch (raw)                          <1 ms      7,663 chars   diff hunks present
+  git log --patch (filtered)                     16 ms      3,779 chars   51% smaller — hunks stripped
+  chars avoided by filter chain: 3,884
+
+Scenario 6  mtime Fast-Path (skip readFileSync on warm reads)
+  cold read    src/cache.ts                       1 ms      2,385 chars   cache miss — stat + read + hash + store
+  warm read    src/cache.ts                      <1 ms      2,394 chars   mtime hit — stat only, no readFileSync
+  note: mtime fast-path avoids readFileSync on unchanged files — benefits large files most
+
+Scenario 7  Dense Keyword Search (sampled mode)
+  keyword "export"  fixture (dense)               1 ms     10,381 chars   sampled mode — 85% smaller
+  keyword "ApiModel50"  fixture (sparse)          <1 ms      1,369 chars   normal mode — 98% smaller
+  chars avoided by targeted sparse search: 68,286
 
 ════════════════════════════════════════════════════════════════
 Summary
-  Total chars avoided:    ~147,195
-  Estimated tokens saved: ~36,799  (4 chars/token)
+  Total chars avoided:    ~209,971
+  Estimated tokens saved: ~52,493  (4 chars/token)
   Watchdog triggers:      1
   Cache entries:          7 total, 0 expired
 ```
 
-The headline numbers: dedup saves 99.8% of re-read chars (69K → 149 byte stub), keyword search finds a specific type definition in 1,369 chars instead of reading 69K chars (98% reduction), and patch hunk stripping cuts git log output by 90%.
+The headline numbers: dedup saves 99.8% of re-read chars (69K → 149 byte stub), keyword search finds a specific type in 1,369 chars vs 69K full read (98% reduction), dense keyword search on a ubiquitous term still yields 85% reduction via sampled mode, and patch hunk stripping cuts `git log` output by 51%. Total estimated token savings: ~52K tokens per benchmark run — up from ~37K before the Phase 9 improvements.
 
 ---
 
@@ -146,7 +158,8 @@ When a session opens, the `CLAUDE.md` inject hook fires and prints a context blo
 - **Tool preferences** — instruction to use `cache_read` and `shell_cached` instead of native tools
 - **High-value files** — files read most frequently across prior sessions (signals which files matter)
 - **Recent session summaries** — what was worked on in the last 3 sessions, what files changed, what branch
-- **Project index** — DB schema, API routes, TypeScript types, env vars, Docker services, file tree
+- **Key decisions** — architectural decisions extracted from prior session transcripts ("instead of X we chose Y because...")
+- **Project index** — DB schema, API routes, TypeScript types, env vars, Docker services, polyglot symbol index, file tree
 
 This means even a fresh session starts with full project context rather than cold.
 
@@ -212,6 +225,8 @@ keyword       — return only lines matching this term + surrounding context
 context_lines — lines of context around each keyword match (default: 10)
 ```
 
+When `keyword` is set, the tool automatically detects dense matches (term appears on >20% of lines after merging) and switches to sampled mode — returning 10 evenly-spaced representative regions rather than one giant merged block.
+
 Claude should prefer this over the native `Read` tool for all file reads during a session.
 
 ### `shell_cached`
@@ -231,7 +246,7 @@ Claude should prefer this over raw shell calls for git log, git status, find, ls
 
 ### `project://index` (resource)
 
-Structural index of the project: DB schema, API routes, TypeScript types, env vars, Docker services, file tree, and live git state. Rebuilt incrementally via file watcher while the server runs.
+Structural index of the project: DB schema, API routes, TypeScript types, env vars, Docker services, polyglot symbol index, file tree, and live git state. Rebuilt incrementally via file watcher while the server runs.
 
 ---
 
@@ -244,10 +259,16 @@ All via environment variables (set in `.mcp.json` `env` block or shell):
 | `AUGMENT_CC_WATCHDOG_THRESHOLD` | `3` | Re-reads before watchdog triggers a full refresh |
 | `AUGMENT_CC_STALE_MS` | `3600000` (1h) | Age at which the project index is considered stale |
 | `AUGMENT_CC_MAX_SESSIONS` | `10` | Sessions to retain per project |
+| `AUGMENT_CC_INJECT_MAX_CHARS` | _(unlimited)_ | Cap total inject block size; trims the project index first, preserving git state and session summaries |
 
 To lower the watchdog threshold for very long sessions (more aggressive refresh), edit the `env` block in your project's `.mcp.json`:
 ```json
 "env": { "AUGMENT_CC_WATCHDOG_THRESHOLD": "2" }
+```
+
+To cap inject output for projects with very large indexes (e.g. many env vars):
+```json
+"env": { "AUGMENT_CC_INJECT_MAX_CHARS": "8000" }
 ```
 
 ---
@@ -259,7 +280,9 @@ On startup (and after file changes via watcher), augment-cc walks the project an
 - **Database schemas** — Prisma models, raw SQL tables, Django models, TypeORM entities
 - **API routes** — Express, Next.js, FastAPI, Rails
 - **TypeScript types** — interfaces, type aliases, GraphQL types
-- **Infrastructure** — Docker services, environment variables
+- **Python symbols** — top-level classes with method signatures, module-level functions (all `.py` files)
+- **Polyglot declarations** — Go, Rust, Java, Kotlin, C#, Swift, Ruby, Elixir, and others via a universal declaration-keyword regex
+- **Infrastructure** — Docker services, environment variables (placeholder values filtered out, capped at 20)
 - **File tree** — depth-limited tree of source files
 
 The index is stored in SQLite and served via the `project://index` MCP resource. It's injected at session start via the CLAUDE.md hook so Claude has full project context before it reads a single file.

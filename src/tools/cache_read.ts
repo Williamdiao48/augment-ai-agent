@@ -144,8 +144,8 @@ export async function cache_read(args: {
   const cached = get(cacheKey);
   const currentMtime = Math.floor(stat.mtimeMs);
 
-  // mtime fast-path: skip readFileSync entirely if mtime unchanged
-  if (cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
+  // mtime fast-path: skip readFileSync entirely if mtime unchanged (not applicable to keyword mode)
+  if (!args.keyword && cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
     if (args._sessionId) recordRead(args._sessionId, absPath, cached.content_hash ?? "");
     return `[cached] ${cached.value}`;
   }
