@@ -120,6 +120,16 @@ export async function cache_read(args: {
     return `Error: file not found: ${absPath}`;
   }
 
+  const cacheKey = `file:${absPath}`;
+  const cached = get(cacheKey);
+  const currentMtime = Math.floor(stat.mtimeMs);
+
+  // mtime fast-path: skip readFileSync entirely if mtime unchanged
+  if (cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
+    if (args._sessionId) recordRead(args._sessionId, absPath, cached.content_hash ?? "");
+    return `[cached] ${cached.value}`;
+  }
+
   // Read current file
   let raw: string;
   try {
@@ -133,12 +143,12 @@ export async function cache_read(args: {
     return keywordExcerpt(raw, basename(absPath), args.keyword, args.context_lines ?? 10);
   }
 
-  const cacheKey = `file:${absPath}`;
-  const cached = get(cacheKey);
   const currentHash = hashContent(raw);
 
-  // Cache hit: same content hash
+  // Cache hit: same content hash (mtime changed but content identical — e.g. touch)
   if (cached && cached.content_hash === currentHash) {
+    set(cacheKey, cached.value, { contentHash: currentHash, fileMtime: currentMtime });
+    if (args._sessionId) recordRead(args._sessionId, absPath, currentHash);
     return `[cached] ${cached.value}`;
   }
 
@@ -151,7 +161,7 @@ export async function cache_read(args: {
     : "";
 
   const result = output + summary;
-  set(cacheKey, result, { contentHash: currentHash });
+  set(cacheKey, result, { contentHash: currentHash, fileMtime: currentMtime });
 
   if (args._sessionId) recordRead(args._sessionId, absPath, currentHash);
 

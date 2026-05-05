@@ -11,6 +11,7 @@ export interface CacheEntry {
   key: string;
   value: string;
   content_hash: string | null;
+  file_mtime: number | null;
   expires_at: number | null;
   created_at: number;
 }
@@ -32,6 +33,7 @@ export function getDb(): Database.Database {
       created_at INTEGER NOT NULL
     )
   `);
+  try { db.exec("ALTER TABLE cache ADD COLUMN file_mtime INTEGER"); } catch {}
 
   return db;
 }
@@ -57,16 +59,17 @@ export function get(key: string): CacheEntry | null {
 export function set(
   key: string,
   value: string,
-  opts: { contentHash?: string; ttlMs?: number } = {}
+  opts: { contentHash?: string; ttlMs?: number; fileMtime?: number } = {}
 ): void {
   const db = getDb();
   db.prepare(`
-    INSERT OR REPLACE INTO cache (key, value, content_hash, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT OR REPLACE INTO cache (key, value, content_hash, file_mtime, expires_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
   `).run(
     key,
     value,
     opts.contentHash ?? null,
+    opts.fileMtime ?? null,
     opts.ttlMs ? Date.now() + opts.ttlMs : null,
     Date.now()
   );
