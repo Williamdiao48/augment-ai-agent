@@ -38,8 +38,30 @@ function keywordExcerpt(raw: string, file: string, keyword: string, contextLines
     Math.min(lines.length - 1, i + contextLines),
   ]);
   const merged = mergeWindows(windows);
-  const shown = merged.slice(0, 10);
-  const omitted = merged.length - shown.length;
+
+  const DENSE_THRESHOLD = 0.20;
+  const MAX_REGIONS = 10;
+  const isDense = matchIndices.length > 1 && merged.length < matchIndices.length * DENSE_THRESHOLD;
+
+  let shown: number[][];
+  let header: string;
+
+  if (isDense) {
+    const step = Math.ceil(matchIndices.length / MAX_REGIONS);
+    const sampledIndices = matchIndices.filter((_, i) => i % step === 0);
+    const sampledWindows = sampledIndices.map(i => [
+      Math.max(0, i - contextLines),
+      Math.min(lines.length - 1, i + contextLines),
+    ]);
+    shown = mergeWindows(sampledWindows).slice(0, MAX_REGIONS);
+    const density = Math.round(lines.length / matchIndices.length);
+    header = `[augment-cc: "${keyword}" is dense in ${file} — ${matchIndices.length} match line(s) in ${lines.length} lines (~1 in every ${density}). Showing ${shown.length} sampled region(s)]`;
+  } else {
+    shown = merged.slice(0, MAX_REGIONS);
+    const omitted = merged.length - shown.length;
+    const omittedNote = omitted > 0 ? ` — ${omitted} region(s) omitted` : "";
+    header = `[augment-cc: ${shown.length} match region(s) for "${keyword}" in ${file} (${matchIndices.length} match line(s))${omittedNote}]`;
+  }
 
   const sections = shown.map(([start, end]) =>
     lines.slice(start, end + 1)
@@ -47,8 +69,6 @@ function keywordExcerpt(raw: string, file: string, keyword: string, contextLines
       .join("\n")
   );
 
-  const omittedNote = omitted > 0 ? ` — ${omitted} region(s) omitted` : "";
-  const header = `[augment-cc: ${shown.length} match region(s) for "${keyword}" in ${file} (${matchIndices.length} match line(s))${omittedNote}]`;
   return `${header}\n\n${sections.join("\n\n---\n\n")}`;
 }
 
