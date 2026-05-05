@@ -1,6 +1,6 @@
 import { resolve, join, dirname } from "path";
 import os from "os";
-import { realpathSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles } from "./indexer/db.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
@@ -82,6 +82,10 @@ function formatSessions(sessions: SessionEntry[]): string | null {
     const titlePart = s.aiTitle ? ` — ${s.aiTitle}` : "";
     lines.push(`### ${date} (${dur} on \`${s.branch}\`)${titlePart}`);
     lines.push(s.summary);
+    if (s.decisions.length > 0) {
+      const excerpts = s.decisions.map(d => `"${d}"`).join(" — ");
+      lines.push(`Key decisions: ${excerpts}`);
+    }
     const allFiles = [...s.filesCreated, ...s.filesModified];
     if (allFiles.length > 0) {
       const shown = allFiles.slice(0, 8).map(f => f.split("/").pop()).join(", ");
@@ -226,6 +230,7 @@ async function runSummarize(): Promise<void> {
     commandsRun: facts.commandsRun,
     messageCount: facts.messageCount,
     aiTitle: facts.aiTitle,
+    decisions: facts.decisions,
     createdAt: Date.now(),
   };
   saveSession(entry);
@@ -358,8 +363,6 @@ async function runInit(root: string): Promise<void> {
   await rebuildProjectIndex(root);
 
   // 5. Report
-  const stored = getStoredIndex(root);
-  const fileCount = stored ? (JSON.parse(stored.index_json) as Record<string, unknown>) : null;
   results.push(`  [done] Project index built`);
 
   process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
