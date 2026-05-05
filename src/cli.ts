@@ -130,7 +130,8 @@ async function runInject(root: string): Promise<void> {
   const routeCount = index.routes.express.length + index.routes.nextjs.length
     + index.routes.fastapi.length + index.routes.rails.length;
   const typeCount = index.types.tsInterfaces.length + index.types.graphqlTypes.length;
-  const hasMeaningful = modelCount + routeCount + typeCount + index.docker.length > 0;
+  const hasMeaningful = modelCount + routeCount + typeCount + index.docker.length
+    + (index.python?.length ?? 0) + (index.declarations?.length ?? 0) > 0;
 
   const qualityNote = hasMeaningful
     ? null

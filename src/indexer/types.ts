@@ -131,6 +131,24 @@ export interface FileTreeSummary {
   topDirs: string[];
 }
 
+export interface PythonMethod {
+  name: string;
+  signature: string;
+}
+
+export interface PythonSymbol {
+  name: string;
+  kind: "class" | "function";
+  methods: PythonMethod[];
+  sourceFile: string;
+}
+
+export interface GenericSymbol {
+  keyword: string;
+  name: string;
+  sourceFile: string;
+}
+
 export interface DatabaseSchema {
   prismaModels: PrismaModel[];
   prismaEnums: PrismaEnum[];
@@ -160,6 +178,8 @@ export interface ProjectIndex {
   env: EnvKey[];
   docker: DockerService[];
   fileTree: FileTreeSummary;
+  python: PythonSymbol[];
+  declarations: GenericSymbol[];
   builtAt: number;
 }
 

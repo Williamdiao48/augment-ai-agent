@@ -18,8 +18,15 @@ import { extractTypescript, isHighValueTypeFile } from "./extractors/typescript.
 import { extractGraphql } from "./extractors/graphql.js";
 import { extractEnv } from "./extractors/env.js";
 import { extractDocker } from "./extractors/docker.js";
+import { extractPython } from "./extractors/python.js";
+import { extractGenericDeclarations } from "./extractors/generic.js";
 import type { ProjectIndex, DatabaseSchema, RouteList, TypeSchema } from "./types.js";
 import type { Ignore } from "ignore";
+
+const GENERIC_EXTS = new Set([
+  ".go", ".rs", ".java", ".rb", ".cpp", ".hpp", ".c", ".h",
+  ".kt", ".php", ".cs", ".swift", ".scala", ".ex", ".exs",
+]);
 
 function emptyIndex(root: string): ProjectIndex {
   return {
@@ -31,6 +38,8 @@ function emptyIndex(root: string): ProjectIndex {
     env: [],
     docker: [],
     fileTree: { totalFiles: 0, byExtension: {}, topDirs: [] },
+    python: [],
+    declarations: [],
     builtAt: Date.now(),
   };
 }
@@ -175,6 +184,22 @@ export class IndexerService {
       // TypeScript types — collect candidates, process after
       if (detectedTypes.has("typescript") && (ext === ".ts" || ext === ".tsx") && isHighValueTypeFile(filePath)) {
         tsTypeFiles.push(filePath);
+      }
+
+      // Python class/function extraction (all .py files)
+      if (detectedTypes.has("python") && ext === ".py") {
+        try {
+          index.python.push(...extractPython(content, filePath));
+          saveFileHash(this.root, filePath, hash, "python");
+        } catch (e) { process.stderr.write(`augment-cc [python] ${e}\n`); }
+      }
+
+      // Generic declaration fallback — languages with no dedicated extractor
+      if (GENERIC_EXTS.has(ext)) {
+        try {
+          index.declarations.push(...extractGenericDeclarations(content, filePath));
+          saveFileHash(this.root, filePath, hash, "generic");
+        } catch (e) { process.stderr.write(`augment-cc [generic] ${e}\n`); }
       }
     }
 

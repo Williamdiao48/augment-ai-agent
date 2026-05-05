@@ -1,3 +1,4 @@
+import { basename, relative } from "path";
 import type { ProjectIndex } from "./types.js";
 
 const MAX_MODELS = 10;
@@ -6,6 +7,10 @@ const MAX_ROUTES = 8;
 const MAX_TYPES = 10;
 const MAX_TYPE_MEMBERS = 4;
 const MAX_GQL_FIELDS = 4;
+const MAX_PYTHON_FILES = 10;
+const MAX_PYTHON_SYMBOLS_PER_FILE = 5;
+const MAX_GENERIC_FILES = 10;
+const MAX_GENERIC_PER_FILE = 5;
 
 function more(n: number): string {
   return n > 0 ? ` [+${n} more]` : "";
@@ -65,6 +70,44 @@ export function formatIndex(index: ProjectIndex): string {
         const { shown: fields, rest: fr } = truncateList(m.fields, MAX_FIELDS);
         sections.push(`- ${m.name}: ${fields.map((f) => f.name).join(", ")}${more(fr)}`);
       }
+    }
+  }
+
+  // --- Python Symbols ---
+  if (index.python.length) {
+    const byFile = new Map<string, typeof index.python>();
+    for (const sym of index.python) {
+      const key = sym.sourceFile;
+      if (!byFile.has(key)) byFile.set(key, []);
+      byFile.get(key)!.push(sym);
+    }
+    const totalClasses = index.python.filter((s) => s.kind === "class").length;
+    const totalFns = index.python.filter((s) => s.kind === "function").length;
+    const fileCount = byFile.size;
+    const fileRest = Math.max(0, fileCount - MAX_PYTHON_FILES);
+    sections.push("", `## Python Symbols (${totalClasses} classes, ${totalFns} functions across ${fileCount} files${fileRest > 0 ? ` [+${fileRest} more files]` : ""})`);
+
+    let filesShown = 0;
+    for (const [filePath, syms] of byFile) {
+      if (filesShown >= MAX_PYTHON_FILES) break;
+      filesShown++;
+      const rel = relative(index.projectRoot, filePath) || basename(filePath);
+      const parts: string[] = [];
+      let symCount = 0;
+      let extraSyms = 0;
+      for (const sym of syms) {
+        if (symCount >= MAX_PYTHON_SYMBOLS_PER_FILE) { extraSyms++; continue; }
+        symCount++;
+        if (sym.kind === "function") {
+          parts.push(`def ${sym.name}`);
+        } else {
+          const { shown: methods, rest: mr } = truncateList(sym.methods, 4);
+          const methodNames = methods.map((m) => m.name).join(", ");
+          parts.push(`${sym.name}${methods.length ? ` [${methodNames}${mr > 0 ? `, +${mr} more` : ""}]` : ""}`);
+        }
+      }
+      const suffix = extraSyms > 0 ? ` [+${extraSyms} more]` : "";
+      sections.push(`- ${rel}: ${parts.join(", ")}${suffix}`);
     }
   }
 
@@ -137,6 +180,40 @@ export function formatIndex(index: ProjectIndex): string {
       const ports = s.ports.length ? ` → ${s.ports.join(", ")}` : "";
       const deps = s.dependsOn.length ? ` [needs: ${s.dependsOn.join(", ")}]` : "";
       sections.push(`- ${s.name} (${s.image})${ports}${deps}`);
+    }
+  }
+
+  // --- Generic Declarations ---
+  if (index.declarations.length) {
+    const byFile = new Map<string, typeof index.declarations>();
+    for (const sym of index.declarations) {
+      if (!byFile.has(sym.sourceFile)) byFile.set(sym.sourceFile, []);
+      byFile.get(sym.sourceFile)!.push(sym);
+    }
+    const extLangMap: Record<string, string> = {
+      ".go": "Go", ".rs": "Rust", ".java": "Java", ".rb": "Ruby",
+      ".cpp": "C++", ".hpp": "C++", ".c": "C", ".h": "C/C++",
+      ".kt": "Kotlin", ".php": "PHP", ".cs": "C#", ".swift": "Swift",
+      ".scala": "Scala", ".ex": "Elixir", ".exs": "Elixir",
+    };
+    const langCounts: Record<string, number> = {};
+    for (const sym of index.declarations) {
+      const ext = sym.sourceFile.slice(sym.sourceFile.lastIndexOf("."));
+      const lang = extLangMap[ext] ?? ext;
+      langCounts[lang] = (langCounts[lang] ?? 0) + 1;
+    }
+    const langs = Object.entries(langCounts).sort((a, b) => b[1] - a[1]).map(([l]) => l).join(", ");
+    const fileRest = Math.max(0, byFile.size - MAX_GENERIC_FILES);
+    sections.push("", `## Declarations (${langs} — ${byFile.size} files, ${index.declarations.length} symbols${fileRest > 0 ? ` [+${fileRest} more files]` : ""})`);
+
+    let filesShown = 0;
+    for (const [filePath, syms] of byFile) {
+      if (filesShown >= MAX_GENERIC_FILES) break;
+      filesShown++;
+      const rel = relative(index.projectRoot, filePath) || basename(filePath);
+      const { shown, rest } = truncateList(syms, MAX_GENERIC_PER_FILE);
+      const symStr = shown.map((s) => `${s.keyword} ${s.name}`).join(", ");
+      sections.push(`- ${rel}: ${symStr}${rest > 0 ? ` [+${rest} more]` : ""}`);
     }
   }
 
