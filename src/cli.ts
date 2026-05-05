@@ -112,9 +112,8 @@ async function runInject(root: string): Promise<void> {
   const gitBlock = formatGitState(getGitState(root));
   const toolPrefs = [
     "## augment-cc Tool Preferences",
-    "- Use `cache_read` (MCP tool) instead of the native `Read` tool for all file reads.",
-    "  Enables session-level deduplication: repeated reads return a stub instead of re-injecting the full file, preserving context window space.",
-    "- Use `shell_cached` (MCP tool) for read-only shell commands (git log, find, ls).",
+    "- Prefer `cache_read` over native Read for file reads (session dedup — repeated reads return a stub, not full content).",
+    "- Prefer `shell_cached` for read-only shell commands (git log, find, ls).",
   ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
 
@@ -137,7 +136,21 @@ async function runInject(root: string): Promise<void> {
     ? null
     : `<!-- augment-cc: index is file-tree only (detected: ${index.detectedTypes.join(", ") || "none"}) — project may use unrecognized frameworks. Don't over-trust this index. -->`;
 
-  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote, stored.index_md].filter(Boolean);
+  const MAX_CHARS = Number(process.env.AUGMENT_CC_INJECT_MAX_CHARS ?? 0);
+  let indexBlock: string | null = stored.index_md;
+  if (MAX_CHARS > 0) {
+    const fixedChars = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote]
+      .filter(Boolean)
+      .join("\n\n").length;
+    const indexBudget = MAX_CHARS - fixedChars - 4;
+    if (indexBudget <= 0) {
+      indexBlock = `[augment-cc: index omitted — AUGMENT_CC_INJECT_MAX_CHARS budget exhausted by other sections]`;
+    } else if (indexBlock.length > indexBudget) {
+      indexBlock = indexBlock.slice(0, indexBudget) + `\n[augment-cc: index truncated — increase AUGMENT_CC_INJECT_MAX_CHARS to see more]`;
+    }
+  }
+
+  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 

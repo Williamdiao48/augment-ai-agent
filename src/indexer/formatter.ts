@@ -11,6 +11,8 @@ const MAX_PYTHON_FILES = 10;
 const MAX_PYTHON_SYMBOLS_PER_FILE = 5;
 const MAX_GENERIC_FILES = 10;
 const MAX_GENERIC_PER_FILE = 5;
+const MAX_ENV = 20;
+const PLACEHOLDER_RE = /^(?:your[-_]|<[^>]+>|x{3,}|change[-_]?me|placeholder|todo|replace|example\.com)/i;
 
 function more(n: number): string {
   return n > 0 ? ` [+${n} more]` : "";
@@ -166,11 +168,17 @@ export function formatIndex(index: ProjectIndex): string {
 
   // --- Env ---
   if (index.env.length) {
-    const secrets = index.env.filter((e) => e.isSecret);
-    const withDefaults = index.env.filter((e) => !e.isSecret && e.defaultValue !== null);
     sections.push("", `## Environment Variables (${index.env.length} keys)`);
-    if (secrets.length) sections.push(`Secrets (${secrets.length}): ${secrets.map((e) => e.name).join(", ")}`);
-    if (withDefaults.length) sections.push(`With defaults: ${withDefaults.map((e) => `${e.name}=${e.defaultValue}`).join(", ")}`);
+    const secrets = index.env.filter((e) => e.isSecret);
+    if (secrets.length) {
+      const { shown: shownS, rest: restS } = truncateList(secrets, MAX_ENV);
+      sections.push(`Secrets (${secrets.length}): ${shownS.map((e) => e.name).join(", ")}${restS > 0 ? ` [+${restS} more]` : ""}`);
+    }
+    const withDefaults = index.env.filter((e) => !e.isSecret && e.defaultValue !== null && !PLACEHOLDER_RE.test(e.defaultValue!));
+    if (withDefaults.length) {
+      const { shown: shownD, rest: restD } = truncateList(withDefaults, MAX_ENV);
+      sections.push(`With defaults: ${shownD.map((e) => `${e.name}=${e.defaultValue}`).join(", ")}${restD > 0 ? ` [+${restD} more]` : ""}`);
+    }
   }
 
   // --- Docker ---
