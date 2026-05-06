@@ -306,11 +306,9 @@ function checkHookConfig(root: string): HookConfig {
   return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook, hasPermissions };
 }
 
-// ── init ───────────────────────────────────────────────────────────────────
+// ── init / upgrade shared config writer ───────────────────────────────────
 
-async function runInit(root: string): Promise<void> {
-  initIndexDb();
-  const binPath = realpathSync(process.argv[1]);
+async function writeHookConfig(root: string, binPath: string): Promise<string[]> {
   const results: string[] = [];
 
   // 1. .mcp.json
@@ -427,14 +425,38 @@ async function runInit(root: string): Promise<void> {
   mkdirSync(localSettingsDir, { recursive: true });
   writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
 
-  // 6. First index build
+  return results;
+}
+
+// ── init ───────────────────────────────────────────────────────────────────
+
+async function runInit(root: string): Promise<void> {
+  initIndexDb();
+  const binPath = realpathSync(process.argv[1]);
+
+  const results = await writeHookConfig(root, binPath);
+
   process.stderr.write("augment-cc: building initial project index...\n");
   await rebuildProjectIndex(root);
-
-  // 7. Report
   results.push(`  [done] Project index built`);
 
   process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
+}
+
+// ── upgrade ────────────────────────────────────────────────────────────────
+
+async function runUpgrade(root: string): Promise<void> {
+  initIndexDb();
+  const binPath = realpathSync(process.argv[1]);
+
+  const results = await writeHookConfig(root, binPath);
+
+  const allSkipped = results.every(r => r.includes("[skip]"));
+  if (allSkipped) {
+    process.stdout.write(`\naugment-cc upgrade — ${root}\n\n${results.join("\n")}\n\nAll hooks up to date. No restart needed.\n`);
+  } else {
+    process.stdout.write(`\naugment-cc upgrade — ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate any new hooks.\n`);
+  }
 }
 
 // ── status ─────────────────────────────────────────────────────────────────
@@ -486,11 +508,11 @@ function runStatus(root: string): void {
   // Hooks
   lines.push("Hooks");
   const tick = (ok: boolean) => ok ? "✓" : "✗";
-  lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc init"}`);
-  lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc init"}`);
-  lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc init"}`);
-  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read → cache_read redirect active" : "not found — run augment-cc init"}`);
-  lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc init"}`);
+  lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read → cache_read redirect active" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -501,6 +523,7 @@ export async function runCli(argv: string[]): Promise<void> {
   const command = argv[2];
   const root = parseProjectRoot(argv);
   if (command === "init") return runInit(root);
+  if (command === "upgrade") return runUpgrade(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
   if (command === "summarize") return runSummarize();
@@ -518,7 +541,8 @@ export async function runCli(argv: string[]): Promise<void> {
     "Usage: augment-cc <command> [--project-root <path>]",
     "",
     "Commands:",
-    "  init          Set up augment-cc in the current project",
+    "  init          Set up augment-cc in the current project (writes hooks + builds index)",
+    "  upgrade       Re-apply latest hook config without rebuilding the index (run after git pull)",
     "  inject        Print context injection block (used by CLAUDE.md hook)",
     "  refresh       Force-rebuild the project index",
     "  summarize     Parse session transcript and save summary (used by Stop hook)",
