@@ -66,7 +66,6 @@ const LINE = "═".repeat(64);
 const line = "─".repeat(64);
 
 let charsAvoided = 0;
-let watchdogCount = 0;
 
 // ─────────────────────────────────────────────────────────────
 console.log(`\naugment-cc benchmark — ${ROOT}`);
@@ -93,8 +92,8 @@ row(`cold read    ${file1}`, s1cold.ms, s1cold.out.length, "cache miss — disk 
 row(`warm read    ${file1}`, s1warm.ms, s1warmContent.length, "cache hit  — hash match, no reprocessing");
 console.log(`  note: content cache ensures stable output across sessions; primary token savings come from dedup (scenario 2)\n`);
 
-// ══ Scenario 2: Session dedup + watchdog ═════════════════════
-console.log("Scenario 2  Session Deduplication + Compaction Watchdog");
+// ══ Scenario 2: Session dedup + diff-based change detection ══
+console.log("Scenario 2  Session Deduplication + Diff-based Change Detection");
 console.log(line);
 
 const sid2 = newSid();
@@ -104,17 +103,17 @@ const r2a = await timed(() => cache_read({ path: FIXTURE_PATH, _sessionId: sid2 
 const r2b = await timed(() => cache_read({ path: FIXTURE_PATH, _sessionId: sid2 }));
 const r2c = await timed(() => cache_read({ path: FIXTURE_PATH, _sessionId: sid2 }));
 
-const isStub = r2b.out.includes("already read this session");
-const isWdog = r2c.out.includes("compaction watchdog");
-if (isWdog) watchdogCount++;
+const isStub2b = r2b.out.includes("already read this session");
+const isStub2c = r2c.out.includes("already read this session");
 
 row(`read 1  fixture (${fixtureLines.length} lines)`, r2a.ms, r2a.out.length, "full content");
-row(`read 2  fixture (same session)`,                 r2b.ms, r2b.out.length, isStub ? "dedup stub ← context saved" : "unexpected");
-row(`read 3  fixture (same session)`,                 r2c.ms, r2c.out.length, isWdog ? "watchdog REFRESH ← compaction guard" : "unexpected");
+row(`read 2  fixture (same session)`,                 r2b.ms, r2b.out.length, isStub2b ? "dedup stub ← unchanged" : "unexpected");
+row(`read 3  fixture (same session)`,                 r2c.ms, r2c.out.length, isStub2c ? "dedup stub ← unchanged" : "unexpected");
 
 const dedupSaved = Math.max(0, r2a.out.length - r2b.out.length);
 charsAvoided += dedupSaved;
-console.log(`  chars avoided by dedup stub: ${fmt(dedupSaved)}\n`);
+console.log(`  chars avoided by dedup stub: ${fmt(dedupSaved)}`);
+console.log(`  note: re-reads return a stub when file is unchanged; a diff is shown when the file was modified\n`);
 
 // ══ Scenario 3: Keyword excerpt ══════════════════════════════
 console.log("Scenario 3  Keyword Excerpt Search");
@@ -228,6 +227,5 @@ console.log("Summary");
 const s = stats();
 console.log(`  Total chars avoided:    ~${fmt(charsAvoided)}`);
 console.log(`  Estimated tokens saved: ~${fmt(Math.round(charsAvoided / 4))}  (4 chars/token)`);
-console.log(`  Watchdog triggers:      ${watchdogCount}`);
 console.log(`  Cache entries:          ${s.total} total, ${s.expired} expired`);
 console.log();

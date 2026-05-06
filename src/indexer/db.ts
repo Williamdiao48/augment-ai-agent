@@ -199,6 +199,12 @@ export function recordRead(sessionId: string, filePath: string, contentHash: str
     .run(sessionId, filePath, contentHash, now, now);
 }
 
+export function refreshSessionHash(sessionId: string, filePath: string, newHash: string): void {
+  getDb()
+    .prepare("UPDATE session_reads SET content_hash = ? WHERE session_id = ? AND file_path = ?")
+    .run(newHash, sessionId, filePath);
+}
+
 export function getTopReadFiles(projectRoot: string, limit: number = 5): Array<{ file_path: string; session_count: number; total_reads: number }> {
   type Row = { file_path: string; session_count: number; total_reads: number };
   return getDb()

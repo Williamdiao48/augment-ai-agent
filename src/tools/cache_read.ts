@@ -1,9 +1,22 @@
 import { readFileSync, statSync } from "fs";
 import { resolve, basename } from "path";
+import { createPatch } from "diff";
 import { hashContent, get, set } from "../cache.js";
-import { hasBeenRead, recordRead } from "../indexer/db.js";
+import { hasBeenRead, recordRead, refreshSessionHash } from "../indexer/db.js";
 
-const WATCHDOG_THRESHOLD = Number(process.env.AUGMENT_CC_WATCHDOG_THRESHOLD ?? 3);
+// ── Diff helper ───────────────────────────────────────────────────────────
+
+const MAX_DIFF_LINES = 150;
+
+function computeDiff(oldContent: string, newContent: string, filename: string): string {
+  const patch = createPatch(filename, oldContent, newContent, "", "");
+  const lines = patch.split("\n").slice(4); // strip unified diff file header
+  if (lines.length <= MAX_DIFF_LINES) return lines.join("\n");
+  return (
+    lines.slice(0, MAX_DIFF_LINES).join("\n") +
+    `\n[diff truncated — ${lines.length - MAX_DIFF_LINES} more lines. File changed substantially; request a full re-read if needed.]`
+  );
+}
 
 // ── Keyword excerpt ────────────────────────────────────────────────────────
 
@@ -107,29 +120,59 @@ export async function cache_read(args: {
   const absPath = resolve(args.project_root ?? process.cwd(), args.path);
   const maxLines = args.max_lines ?? 500;
 
-  // Session-level dedup + compaction watchdog
+  // Session-level dedup + diff-based change detection
   if (args._sessionId) {
     const prior = hasBeenRead(args._sessionId, absPath);
     if (prior) {
       recordRead(args._sessionId, absPath, prior.content_hash);
-      const newCount = prior.read_count + 1;
 
-      if (newCount % WATCHDOG_THRESHOLD === 0) {
-        let content: string;
-        try {
-          const raw = readFileSync(absPath, "utf-8");
-          const lines = raw.split("\n");
-          const maxLines = args.max_lines ?? 500;
-          const truncated = lines.length > maxLines;
-          content = lines.slice(0, maxLines).join("\n") +
-            (truncated ? `\n[truncated: showing ${maxLines}/${lines.length} lines]` : "");
-        } catch {
-          content = "[augment-cc: could not re-read file — it may have been deleted or moved]";
-        }
-        return `[augment-cc: compaction watchdog — ${basename(absPath)} has been requested ${newCount} times this session. Refreshing content to restore context.]\n\n${content}`;
+      const cacheKey = `file:${absPath}`;
+      const cached = get(cacheKey);
+
+      let stat: ReturnType<typeof statSync>;
+      try {
+        stat = statSync(absPath);
+      } catch {
+        return `[augment-cc: ${basename(absPath)} was read this session but can no longer be found — it may have been deleted or moved.]`;
       }
 
-      return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. Content is already in your context; reading again wastes tokens.]`;
+      const currentMtime = Math.floor(stat.mtimeMs);
+
+      // mtime unchanged → file definitely the same → stub
+      if (cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
+        return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. File is unchanged since last read.]`;
+      }
+
+      // mtime changed → read current file
+      let newRaw: string;
+      try {
+        newRaw = readFileSync(absPath, "utf-8");
+      } catch (e) {
+        return `Error reading file: ${e}`;
+      }
+
+      const newHash = hashContent(newRaw);
+
+      // Hash same → cosmetic write (touch, formatter no-op, etc.) → update mtime, return stub
+      if (newHash === prior.content_hash) {
+        if (cached) set(cacheKey, cached.value, { contentHash: newHash, fileMtime: currentMtime });
+        return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. File mtime changed but content is identical.]`;
+      }
+
+      // Content actually changed → compute diff, update cache + session hash
+      const oldContent = cached?.value ?? "";
+      const maxLines = args.max_lines ?? 500;
+      const newLines = newRaw.split("\n");
+      const truncated = newLines.length > maxLines;
+      const newContent =
+        newLines.slice(0, maxLines).join("\n") +
+        (truncated ? `\n[truncated: showing ${maxLines}/${newLines.length} lines]` : "");
+
+      set(cacheKey, newContent, { contentHash: newHash, fileMtime: currentMtime });
+      refreshSessionHash(args._sessionId, absPath, newHash);
+
+      const diffText = computeDiff(oldContent, newContent, basename(absPath));
+      return `[augment-cc: ${basename(absPath)} was modified since last read — showing diff]\n\n${diffText}`;
     }
   }
 

@@ -13,7 +13,7 @@ Built for heavy Claude Code usage where context compaction is a real constraint.
 | **File read cache** | Same file read twice in one session re-injects the full content — burning context |
 | **mtime fast-path** | Warm cache hits skip `readFileSync` entirely — stat-only check on unchanged files |
 | **Session dedup** | After compaction, Claude reaches for files it already read — dedup returns a stub instead |
-| **Compaction watchdog** | If a file is re-read 3× in a session, the context was probably compacted — refresh it automatically |
+| **Diff-based re-read** | If a file is re-read in a session and the content changed, return a unified diff instead of the full file |
 | **Shell output filters** | `git log --patch` dumps thousands of diff lines — strip hunks, keep commit metadata |
 | **Dense keyword handling** | Search terms that appear on every line collapse into a giant blob — sampled mode shows 10 evenly-spaced regions instead |
 | **Project index** | Every session starts cold on project structure — inject a structural snapshot at session start |
@@ -33,11 +33,12 @@ Scenario 1  File Read Caching (content-hash cache)
   warm read    src/index.ts                      <1 ms      3,896 chars   cache hit  — hash match, no reprocessing
   note: content cache ensures stable output across sessions; primary token savings come from dedup (scenario 2)
 
-Scenario 2  Session Deduplication + Compaction Watchdog
-  read 1  fixture (498 lines)                     1 ms     69,655 chars   full content
-  read 2  fixture (same session)                 <1 ms        149 chars   dedup stub ← context saved
-  read 3  fixture (same session)                  1 ms     69,800 chars   watchdog REFRESH ← compaction guard
-  chars avoided by dedup stub: 69,506
+Scenario 2  Session Deduplication + Diff-based Change Detection
+  read 1  fixture (498 lines)                     2 ms     69,655 chars   full content
+  read 2  fixture (same session)                  1 ms        119 chars   dedup stub ← unchanged
+  read 3  fixture (same session)                  1 ms        119 chars   dedup stub ← unchanged
+  chars avoided by dedup stub: 69,536
+  note: re-reads return a stub when file is unchanged; a diff is shown when the file was modified
 
 Scenario 3  Keyword Excerpt Search
   full read    fixture (498 lines)                1 ms     69,664 chars   all lines returned
@@ -68,13 +69,12 @@ Scenario 7  Dense Keyword Search (sampled mode)
 
 ════════════════════════════════════════════════════════════════
 Summary
-  Total chars avoided:    ~209,971
-  Estimated tokens saved: ~52,493  (4 chars/token)
-  Watchdog triggers:      1
-  Cache entries:          7 total, 0 expired
+  Total chars avoided:    ~208,400
+  Estimated tokens saved: ~52,100  (4 chars/token)
+  Cache entries:          18 total, 8 expired
 ```
 
-The headline numbers: dedup saves 99.8% of re-read chars (69K → 149 byte stub), keyword search finds a specific type in 1,369 chars vs 69K full read (98% reduction), dense keyword search on a ubiquitous term still yields 85% reduction via sampled mode, and patch hunk stripping cuts `git log` output by 51%. Total estimated token savings: ~52K tokens per benchmark run — up from ~37K before the Phase 9 improvements.
+The headline numbers: dedup saves 99.8% of re-read chars (69K → 119 byte stub), keyword search finds a specific type in 1,369 chars vs 69K full read (98% reduction), dense keyword search on a ubiquitous term still yields 85% reduction via sampled mode, and patch hunk stripping cuts `git log` output by 54%. When a file is modified mid-session, augment-cc returns a unified diff instead of the full file — only the delta enters context. Total estimated token savings: ~52K tokens per benchmark run.
 
 ---
 
@@ -178,8 +178,8 @@ This means even a fresh session starts with full project context rather than col
 
 augment-cc is specifically designed for sessions that hit compaction. When compaction occurs, Claude loses earlier context and starts re-reading files it already processed. augment-cc intercepts those re-reads:
 
-- **First re-read after compaction** → returns a short stub (`~130 chars`) instead of re-injecting the full file. Saves the context that re-injection would cost.
-- **Third re-read of the same file** → compaction has probably happened twice. The watchdog fires and returns a full refresh with a warning header, so Claude gets back what it lost.
+- **Re-read, file unchanged** → returns a short stub (`~120 chars`) instead of re-injecting the full file. The stub confirms the file is unchanged so Claude knows its cached knowledge is still valid.
+- **Re-read, file was modified** → returns a unified diff of what changed since the last read. Only the delta enters context — not the full file again.
 
 To get this benefit on an existing project you're already working in:
 
@@ -188,7 +188,7 @@ To get this benefit on an existing project you're already working in:
 augment-cc init
 
 # Restart Claude Code, then continue your session as normal
-# augment-cc will handle dedup and watchdog transparently
+# augment-cc will handle dedup and diffs transparently
 ```
 
 ---
@@ -265,15 +265,9 @@ All via environment variables (set in `.mcp.json` `env` block or shell):
 
 | Variable | Default | Description |
 |---|---|---|
-| `AUGMENT_CC_WATCHDOG_THRESHOLD` | `3` | Re-reads before watchdog triggers a full refresh |
 | `AUGMENT_CC_STALE_MS` | `3600000` (1h) | Age at which the project index is considered stale |
 | `AUGMENT_CC_MAX_SESSIONS` | `10` | Sessions to retain per project |
 | `AUGMENT_CC_INJECT_MAX_CHARS` | _(unlimited)_ | Cap total inject block size; trims the project index first, preserving git state and session summaries |
-
-To lower the watchdog threshold for very long sessions (more aggressive refresh), edit the `env` block in your project's `.mcp.json`:
-```json
-"env": { "AUGMENT_CC_WATCHDOG_THRESHOLD": "2" }
-```
 
 To cap inject output for projects with very large indexes (e.g. many env vars):
 ```json
