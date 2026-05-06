@@ -1,7 +1,7 @@
 import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit } from "./indexer/db.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
@@ -154,7 +154,10 @@ async function runInject(root: string): Promise<void> {
     }
   }
 
-  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote, indexBlock].filter(Boolean);
+  const auditStored = getStoredAudit(root);
+  const auditBlock = auditStored?.audit_md || null;
+
+  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
@@ -162,6 +165,55 @@ async function runRefresh(root: string): Promise<void> {
   process.stderr.write(`augment-cc: rebuilding index for ${root}...\n`);
   await rebuildProjectIndex(root);
   process.stderr.write("augment-cc: done.\n");
+}
+
+// ── audit ──────────────────────────────────────────────────────────────────
+
+import type { AuditResult } from "./indexer/audit.js";
+
+function formatAuditReport(result: AuditResult, root: string): string {
+  const lines: string[] = [`augment-cc audit — ${root}`, "", `  Files analyzed: ${result.analyzedCount}`];
+  const OVERSIZED_LINES = Number(process.env.AUGMENT_CC_AUDIT_OVERSIZED_LINES ?? 300);
+  const HIGH_EXPORTS    = Number(process.env.AUGMENT_CC_AUDIT_HIGH_EXPORTS ?? 15);
+
+  if (result.oversizedFiles.length > 0) {
+    lines.push("", `  Oversized files (>${OVERSIZED_LINES} lines):`);
+    for (const f of result.oversizedFiles) {
+      lines.push(`    ${f.path.padEnd(40)} ${f.lines} lines`);
+    }
+  }
+
+  if (result.duplicateSymbols.length > 0) {
+    lines.push("", "  Duplicate symbol names:");
+    for (const d of result.duplicateSymbols) {
+      lines.push(`    ${d.name.padEnd(20)} ${d.files.length} files — ${d.files.join(", ")}`);
+    }
+  }
+
+  if (result.highExportFiles.length > 0) {
+    lines.push("", `  High-export files (>${HIGH_EXPORTS} exports):`);
+    for (const f of result.highExportFiles) {
+      lines.push(`    ${f.path.padEnd(40)} ${f.exportCount} exports`);
+    }
+  }
+
+  if (result.oversizedFiles.length === 0 && result.duplicateSymbols.length === 0 && result.highExportFiles.length === 0) {
+    lines.push("", "  No issues found.");
+  }
+
+  return lines.join("\n");
+}
+
+async function runAudit(root: string): Promise<void> {
+  initIndexDb();
+  const { runCodeAudit } = await import("./indexer/audit.js");
+  const auditResult = await runCodeAudit(root);
+  if (!auditResult) {
+    process.stdout.write("augment-cc audit: no project index found — run augment-cc init first\n");
+    return;
+  }
+  saveAudit(root, JSON.stringify(auditResult.result), auditResult.md ?? "");
+  process.stdout.write(formatAuditReport(auditResult.result, root) + "\n");
 }
 
 async function runSummarize(): Promise<void> {
@@ -440,7 +492,18 @@ async function runInit(root: string): Promise<void> {
   await rebuildProjectIndex(root);
   results.push(`  [done] Project index built`);
 
+  process.stderr.write("augment-cc: running codebase audit...\n");
+  const { runCodeAudit } = await import("./indexer/audit.js");
+  const auditResult = await runCodeAudit(root);
+  if (auditResult) {
+    saveAudit(root, JSON.stringify(auditResult.result), auditResult.md ?? "");
+    results.push(`  [done] Codebase audit complete`);
+  }
+
   process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
+  if (auditResult) {
+    process.stdout.write("\n" + formatAuditReport(auditResult.result, root) + "\n");
+  }
 }
 
 // ── upgrade ────────────────────────────────────────────────────────────────
@@ -524,6 +587,7 @@ export async function runCli(argv: string[]): Promise<void> {
   const root = parseProjectRoot(argv);
   if (command === "init") return runInit(root);
   if (command === "upgrade") return runUpgrade(root);
+  if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
   if (command === "summarize") return runSummarize();
@@ -541,8 +605,9 @@ export async function runCli(argv: string[]): Promise<void> {
     "Usage: augment-cc <command> [--project-root <path>]",
     "",
     "Commands:",
-    "  init          Set up augment-cc in the current project (writes hooks + builds index)",
+    "  init          Set up augment-cc in the current project (writes hooks + builds index + audit)",
     "  upgrade       Re-apply latest hook config without rebuilding the index (run after git pull)",
+    "  audit         Analyze codebase for oversized files, duplicate function names, and dumping-ground files",
     "  inject        Print context injection block (used by CLAUDE.md hook)",
     "  refresh       Force-rebuild the project index",
     "  summarize     Parse session transcript and save summary (used by Stop hook)",

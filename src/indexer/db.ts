@@ -61,6 +61,13 @@ export function initIndexDb(): void {
   try {
     db.exec("ALTER TABLE sessions ADD COLUMN decisions TEXT NOT NULL DEFAULT '[]'");
   } catch { /* column already exists */ }
+
+  // Phase 14 migration: add audit columns to project_index
+  try {
+    db.exec("ALTER TABLE project_index ADD COLUMN audit_json TEXT");
+    db.exec("ALTER TABLE project_index ADD COLUMN audit_md TEXT");
+    db.exec("ALTER TABLE project_index ADD COLUMN audited_at INTEGER");
+  } catch { /* columns already exist */ }
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -226,6 +233,21 @@ export function pruneOldSessionReads(maxAgeMs: number = 48 * 3600 * 1000): void 
   getDb()
     .prepare("DELETE FROM session_reads WHERE first_read_at < ?")
     .run(Date.now() - maxAgeMs);
+}
+
+export function saveAudit(projectRoot: string, auditJson: string, auditMd: string): void {
+  getDb()
+    .prepare("UPDATE project_index SET audit_json = ?, audit_md = ?, audited_at = ? WHERE project_root = ?")
+    .run(auditJson, auditMd, Date.now(), projectRoot);
+}
+
+export function getStoredAudit(projectRoot: string): { audit_md: string; audited_at: number } | null {
+  type Row = { audit_md: string | null; audited_at: number | null };
+  const row = getDb()
+    .prepare("SELECT audit_md, audited_at FROM project_index WHERE project_root = ?")
+    .get(projectRoot) as Row | undefined;
+  if (!row || !row.audit_md || !row.audited_at) return null;
+  return { audit_md: row.audit_md, audited_at: row.audited_at };
 }
 
 function safeJsonParse(s: string): string[] {
