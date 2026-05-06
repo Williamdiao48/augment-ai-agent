@@ -246,6 +246,7 @@ interface HookConfig {
   hasClaudeMd: boolean;
   hasStopHook: boolean;
   hasPreToolUseHook: boolean;
+  hasPermissions: boolean;
 }
 
 function checkHookConfig(root: string): HookConfig {
@@ -281,8 +282,9 @@ function checkHookConfig(root: string): HookConfig {
     });
   } catch { /* missing */ }
 
-  // .claude/settings.local.json PreToolUse hook
+  // .claude/settings.local.json PreToolUse hook + MCP permissions
   let hasPreToolUseHook = false;
+  let hasPermissions = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
     const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
@@ -296,9 +298,12 @@ function checkHookConfig(root: string): HookConfig {
         return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
       });
     });
+    const localPerms = (localSettings.permissions ?? {}) as Record<string, unknown>;
+    const allowed = (Array.isArray(localPerms.allow) ? localPerms.allow : []) as string[];
+    hasPermissions = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
   } catch { /* missing */ }
 
-  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook };
+  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook, hasPermissions };
 }
 
 // ── init ───────────────────────────────────────────────────────────────────
@@ -404,16 +409,29 @@ async function runInit(root: string): Promise<void> {
       matcher: "Read",
       hooks: [{ type: "command", command: `node ${binPath} redirect-read` }],
     });
-    mkdirSync(localSettingsDir, { recursive: true });
-    writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
     results.push("  [done] PreToolUse hook added to .claude/settings.local.json (Read → cache_read redirect)");
   }
 
-  // 5. First index build
+  // 5. .claude/settings.local.json MCP tool permissions (auto-approve cache_read + shell_cached)
+  const MCP_TOOLS = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"];
+  const perms = (localSettings.permissions ?? (localSettings.permissions = {})) as Record<string, unknown>;
+  const allowed = (Array.isArray(perms.allow) ? perms.allow : (perms.allow = [])) as string[];
+  const newTools = MCP_TOOLS.filter(t => !allowed.includes(t));
+  if (newTools.length === 0) {
+    results.push("  [skip] MCP tool permissions already configured");
+  } else {
+    allowed.push(...newTools);
+    results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve cache_read, shell_cached)");
+  }
+
+  mkdirSync(localSettingsDir, { recursive: true });
+  writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
+
+  // 6. First index build
   process.stderr.write("augment-cc: building initial project index...\n");
   await rebuildProjectIndex(root);
 
-  // 6. Report
+  // 7. Report
   results.push(`  [done] Project index built`);
 
   process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
@@ -472,6 +490,7 @@ function runStatus(root: string): void {
   lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc init"}`);
   lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc init"}`);
   lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read → cache_read redirect active" : "not found — run augment-cc init"}`);
+  lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc init"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
