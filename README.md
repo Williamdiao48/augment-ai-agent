@@ -105,7 +105,7 @@ cd /your-project
 augment-cc init
 ```
 
-This does three things automatically:
+This does four things automatically:
 
 **`.mcp.json`** — registers augment-cc as an MCP server for Claude Code:
 ```json
@@ -134,6 +134,15 @@ This does three things automatically:
 }
 ```
 
+**`.claude/settings.local.json`** — adds a PreToolUse hook that intercepts native `Read` calls and redirects Claude to `cache_read` instead. This enforces tool usage at the call site rather than relying on in-context instructions, so it keeps working even after context compaction:
+```json
+{
+  "hooks": {
+    "PreToolUse": [{ "matcher": "Read", "hooks": [{ "type": "command", "command": "node /path/to/augment-cc/dist/index.js redirect-read" }] }]
+  }
+}
+```
+
 Then it builds the initial project index.
 
 ### 3. Restart Claude Code
@@ -146,7 +155,7 @@ The MCP server connects on startup. Restart Claude Code (or the extension host) 
 augment-cc status
 ```
 
-All three hooks should show `✓`. If any show `✗`, re-run `augment-cc init`.
+All four hooks should show `✓`. If any show `✗`, re-run `augment-cc init`.
 
 ---
 

@@ -115,9 +115,9 @@ async function runInject(root: string): Promise<void> {
 
   const gitBlock = formatGitState(getGitState(root));
   const toolPrefs = [
-    "## augment-cc Tool Preferences",
-    "- Prefer `cache_read` over native Read for file reads (session dedup — repeated reads return a stub, not full content).",
-    "- Prefer `shell_cached` for read-only shell commands (git log, find, ls).",
+    "## augment-cc Tool Rules",
+    "**ALWAYS use `cache_read` instead of native Read for file reads.** Native Read bypasses dedup — repeated reads accumulate full content in context instead of returning a short stub.",
+    "**ALWAYS use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
   ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
 
@@ -245,6 +245,7 @@ interface HookConfig {
   hasMcp: boolean;
   hasClaudeMd: boolean;
   hasStopHook: boolean;
+  hasPreToolUseHook: boolean;
 }
 
 function checkHookConfig(root: string): HookConfig {
@@ -280,7 +281,24 @@ function checkHookConfig(root: string): HookConfig {
     });
   } catch { /* missing */ }
 
-  return { hasMcp, hasClaudeMd, hasStopHook };
+  // .claude/settings.local.json PreToolUse hook
+  let hasPreToolUseHook = false;
+  try {
+    const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
+    const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
+    const preHooks = (Array.isArray(localHooks.PreToolUse) ? localHooks.PreToolUse : []) as unknown[];
+    hasPreToolUseHook = preHooks.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      if ((e.matcher as string | undefined) !== "Read") return false;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+      });
+    });
+  } catch { /* missing */ }
+
+  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook };
 }
 
 // ── init ───────────────────────────────────────────────────────────────────
@@ -358,11 +376,44 @@ async function runInit(root: string): Promise<void> {
     results.push("  [done] Stop hook added to ~/.claude/settings.json");
   }
 
-  // 4. First index build
+  // 4. .claude/settings.local.json PreToolUse hook (project-level, blocks native Read)
+  const localSettingsDir = join(root, ".claude");
+  const localSettingsPath = join(localSettingsDir, "settings.local.json");
+  let localSettings: Record<string, unknown> = {};
+  try {
+    localSettings = JSON.parse(readFileSync(localSettingsPath, "utf-8")) as Record<string, unknown>;
+  } catch { /* will create */ }
+
+  const localHooks = (localSettings.hooks ?? (localSettings.hooks = {})) as Record<string, unknown>;
+  if (!Array.isArray(localHooks.PreToolUse)) localHooks.PreToolUse = [];
+  const preToolUseHooks = localHooks.PreToolUse as unknown[];
+
+  const alreadyHasReadHook = preToolUseHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    return (e.matcher as string | undefined) === "Read" &&
+      (e.hooks as Array<Record<string, unknown>> | undefined)?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+      });
+  });
+
+  if (alreadyHasReadHook) {
+    results.push("  [skip] PreToolUse hook already configured");
+  } else {
+    preToolUseHooks.push({
+      matcher: "Read",
+      hooks: [{ type: "command", command: `node ${binPath} redirect-read` }],
+    });
+    mkdirSync(localSettingsDir, { recursive: true });
+    writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
+    results.push("  [done] PreToolUse hook added to .claude/settings.local.json (Read → cache_read redirect)");
+  }
+
+  // 5. First index build
   process.stderr.write("augment-cc: building initial project index...\n");
   await rebuildProjectIndex(root);
 
-  // 5. Report
+  // 6. Report
   results.push(`  [done] Project index built`);
 
   process.stdout.write(`\naugment-cc init complete for ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate the MCP server.\n`);
@@ -420,6 +471,7 @@ function runStatus(root: string): void {
   lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc init"}`);
   lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc init"}`);
   lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc init"}`);
+  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read → cache_read redirect active" : "not found — run augment-cc init"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -434,17 +486,25 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "refresh") return runRefresh(root);
   if (command === "summarize") return runSummarize();
   if (command === "status") return runStatus(root);
+  if (command === "redirect-read") {
+    process.stdout.write(JSON.stringify({
+      decision: "block",
+      reason: "augment-cc: use cache_read MCP tool instead of native Read — it provides session deduplication and mtime fast-path. Call cache_read with the same path argument. (If cache_read is unavailable because the MCP server is not connected, you may fall back to native Read.)",
+    }) + "\n");
+    return;
+  }
   process.stderr.write([
     `augment-cc: unknown command "${command}"`,
     "",
     "Usage: augment-cc <command> [--project-root <path>]",
     "",
     "Commands:",
-    "  init       Set up augment-cc in the current project",
-    "  inject     Print context injection block (used by CLAUDE.md hook)",
-    "  refresh    Force-rebuild the project index",
-    "  summarize  Parse session transcript and save summary (used by Stop hook)",
-    "  status     Show cache stats, session history, and hook configuration",
+    "  init          Set up augment-cc in the current project",
+    "  inject        Print context injection block (used by CLAUDE.md hook)",
+    "  refresh       Force-rebuild the project index",
+    "  summarize     Parse session transcript and save summary (used by Stop hook)",
+    "  status        Show cache stats, session history, and hook configuration",
+    "  redirect-read Output PreToolUse block decision (used by .claude/settings.local.json hook)",
     "",
   ].join("\n"));
   process.exit(1);
