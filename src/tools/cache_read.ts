@@ -7,6 +7,7 @@ import { hasBeenRead, recordRead, refreshSessionHash } from "../indexer/db.js";
 // ── Diff helper ───────────────────────────────────────────────────────────
 
 const MAX_DIFF_LINES = 150;
+const COMPACTION_AGE_MS = Number(process.env.AUGMENT_CC_COMPACTION_AGE_MS ?? 15 * 60 * 1000);
 
 function computeDiff(oldContent: string, newContent: string, filename: string): string {
   const patch = createPatch(filename, oldContent, newContent, "", "");
@@ -104,6 +105,10 @@ export const cache_read_schema = {
         type: "string",
         description: "Project root for resolving relative paths",
       },
+      force: {
+        type: "boolean",
+        description: "Re-inject full file content even if already read this session. Use when you know context was compacted and you need to recover the file.",
+      },
     },
     required: ["path"],
   },
@@ -116,6 +121,8 @@ export async function cache_read(args: {
   _sessionId?: string;
   keyword?: string;
   context_lines?: number;
+  force?: boolean;
+  _samplingFn?: (prompt: string) => Promise<string>;
 }): Promise<string> {
   const absPath = resolve(args.project_root ?? process.cwd(), args.path);
   const maxLines = args.max_lines ?? 500;
@@ -126,6 +133,38 @@ export async function cache_read(args: {
     if (prior) {
       recordRead(args._sessionId, absPath, prior.content_hash);
 
+      if (!args.force) {
+        const ageMs = Date.now() - prior.first_read_at;
+        const ageStr = ageMs < 60_000
+          ? `${Math.round(ageMs / 1000)}s ago`
+          : `${Math.round(ageMs / 60_000)}m ago`;
+
+        // Fast path: too recent for compaction — stub without sampling
+        if (ageMs < COMPACTION_AGE_MS || !args._samplingFn) {
+          const hint = ageMs >= COMPACTION_AGE_MS
+            ? " — sampling unavailable; use force: true if compacted"
+            : " — use force: true if compacted";
+          return `[augment-cc: ${basename(absPath)} already read this session (${ageStr})${hint}]`;
+        }
+
+        // Slow path: age exceeds threshold — ask Claude if content is still in context
+        let inContext = true;
+        try {
+          const answer = await args._samplingFn(
+            `Does your current context window contain the full content of the file '${basename(absPath)}'? Answer only YES or NO.`
+          );
+          inContext = !answer.trim().toUpperCase().startsWith("N");
+        } catch {
+          // sampling failed — assume in context (safe fallback, avoids unnecessary re-inject)
+        }
+
+        if (inContext) {
+          return `[augment-cc: ${basename(absPath)} already read this session (${ageStr}, confirmed in context)]`;
+        }
+        // Claude confirmed content is gone — fall through to re-read below
+      }
+
+      // Re-read path: force: true OR sampling confirmed content is gone
       const cacheKey = `file:${absPath}`;
       const cached = get(cacheKey);
 
@@ -138,9 +177,9 @@ export async function cache_read(args: {
 
       const currentMtime = Math.floor(stat.mtimeMs);
 
-      // mtime unchanged → file definitely the same → stub
+      // File unchanged — return cached content directly
       if (cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
-        return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. File is unchanged since last read.]`;
+        return `[augment-cc: re-injecting ${basename(absPath)} (file unchanged)]\n\n${cached.value}`;
       }
 
       // mtime changed → read current file
@@ -153,15 +192,14 @@ export async function cache_read(args: {
 
       const newHash = hashContent(newRaw);
 
-      // Hash same → cosmetic write (touch, formatter no-op, etc.) → update mtime, return stub
+      // Hash same → cosmetic write → update mtime, return cached content
       if (newHash === prior.content_hash) {
         if (cached) set(cacheKey, cached.value, { contentHash: newHash, fileMtime: currentMtime });
-        return `[augment-cc: ${basename(absPath)} already read this session — hash ${prior.content_hash.slice(0, 8)}. File mtime changed but content is identical.]`;
+        return `[augment-cc: re-injecting ${basename(absPath)} (file unchanged)]\n\n${cached?.value ?? ""}`;
       }
 
-      // Content actually changed → compute diff, update cache + session hash
+      // Content changed → update cache, return diff
       const oldContent = cached?.value ?? "";
-      const maxLines = args.max_lines ?? 500;
       const newLines = newRaw.split("\n");
       const truncated = newLines.length > maxLines;
       const newContent =

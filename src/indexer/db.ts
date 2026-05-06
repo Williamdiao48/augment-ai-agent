@@ -179,11 +179,11 @@ export function pruneOldSessions(projectRoot: string, maxSessions: number): void
     .run(projectRoot, projectRoot, maxSessions);
 }
 
-export function hasBeenRead(sessionId: string, filePath: string): { content_hash: string; read_count: number } | null {
-  const row = getDb()
-    .prepare("SELECT content_hash, read_count FROM session_reads WHERE session_id = ? AND file_path = ?")
-    .get(sessionId, filePath) as { content_hash: string; read_count: number } | undefined;
-  return row ?? null;
+export function hasBeenRead(sessionId: string, filePath: string): { content_hash: string; read_count: number; first_read_at: number } | null {
+  type Row = { content_hash: string; read_count: number; first_read_at: number };
+  return (getDb()
+    .prepare("SELECT content_hash, read_count, first_read_at FROM session_reads WHERE session_id = ? AND file_path = ?")
+    .get(sessionId, filePath) as Row | undefined) ?? null;
 }
 
 export function recordRead(sessionId: string, filePath: string, contentHash: string): void {

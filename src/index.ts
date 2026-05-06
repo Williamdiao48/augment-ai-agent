@@ -25,10 +25,23 @@ server.tool(
     project_root: z.string().optional().describe("Project root for resolving relative paths"),
     keyword: z.string().optional().describe("Return only lines containing this term plus surrounding context. Use when you know what you're looking for — saves context vs reading the full file."),
     context_lines: z.number().optional().describe("Lines of context around each keyword match (default: 10)"),
+    force: z.boolean().optional().describe("Re-inject full file content even if already read this session. Use when you know context was compacted and you need to recover the file."),
   },
-  async (args) => ({
-    content: [{ type: "text", text: await cache_read({ ...args, _sessionId: SESSION_ID }) }],
-  })
+  async (args) => {
+    let samplingFn: ((prompt: string) => Promise<string>) | undefined;
+    if (server.server.getClientCapabilities()?.sampling) {
+      samplingFn = async (prompt: string) => {
+        const result = await server.server.createMessage({
+          messages: [{ role: "user", content: { type: "text", text: prompt } }],
+          maxTokens: 5,
+        });
+        return result.content.type === "text" ? result.content.text : "";
+      };
+    }
+    return {
+      content: [{ type: "text", text: await cache_read({ ...args, _sessionId: SESSION_ID, _samplingFn: samplingFn }) }],
+    };
+  }
 );
 
 server.tool(
