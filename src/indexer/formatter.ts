@@ -1,7 +1,7 @@
 import { basename, relative } from "path";
 import type { ProjectIndex } from "./types.js";
 
-const MAX_MODELS = 10;
+const MAX_MODELS = Number(process.env.AUGMENT_CC_MAX_MODELS ?? 20);
 const MAX_FIELDS = 6;
 const MAX_ROUTES = 8;
 const MAX_TYPES = 10;

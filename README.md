@@ -281,6 +281,7 @@ All via environment variables (set in `.mcp.json` `env` block or shell):
 | `AUGMENT_CC_COMPACTION_AGE_MS` | `900000` (15 min) | Age threshold before MCP sampling is used to check if file content is still in context |
 | `AUGMENT_CC_AUDIT_OVERSIZED_LINES` | `300` | Line count threshold for oversized file warning in audit |
 | `AUGMENT_CC_AUDIT_HIGH_EXPORTS` | `15` | Export count threshold for dumping-ground file warning in audit |
+| `AUGMENT_CC_MAX_MODELS` | `20` | Max DB models shown in inject block and project index (raise for projects with large schemas) |
 
 To cap inject output for projects with very large indexes (e.g. many env vars):
 ```json

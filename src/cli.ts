@@ -119,6 +119,7 @@ async function runInject(root: string): Promise<void> {
     "**Use `cache_read` for information gathering** (exploring code, reading for context or reference). It deduplicates re-reads — unchanged files return a ~120-char stub instead of re-injecting full content.",
     "**Before Edit or Write: use native Read with `offset` + `limit`** scoped to just the lines you are changing. This satisfies the tool requirement at minimal token cost. Do not use native Read for information gathering.",
     "**If `cache_read` returns a stub and you have lost context to compaction:** call `cache_read` with `force: true` to recover the full file before editing.",
+    "**If you lose project context (schema, routes, types, file tree) to compaction:** read the `project://index` MCP resource to recover the full project index without re-reading individual files.",
     "**Always use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
   ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
