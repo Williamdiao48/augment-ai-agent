@@ -116,8 +116,10 @@ async function runInject(root: string): Promise<void> {
   const gitBlock = formatGitState(getGitState(root));
   const toolPrefs = [
     "## augment-cc Tool Rules",
-    "**ALWAYS use `cache_read` instead of native Read for file reads.** Native Read bypasses dedup — repeated reads accumulate full content in context instead of returning a short stub.",
-    "**ALWAYS use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
+    "**Use `cache_read` for information gathering** (exploring code, reading for context or reference). It deduplicates re-reads — unchanged files return a ~120-char stub instead of re-injecting full content.",
+    "**Before Edit or Write: use native Read with `offset` + `limit`** scoped to just the lines you are changing. This satisfies the tool requirement at minimal token cost. Do not use native Read for information gathering.",
+    "**If `cache_read` returns a stub and you have lost context to compaction:** call `cache_read` with `force: true` to recover the full file before editing.",
+    "**Always use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
   ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
 
@@ -459,7 +461,7 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
       matcher: "Read",
       hooks: [{ type: "command", command: `node ${binPath} redirect-read` }],
     });
-    results.push("  [done] PreToolUse hook added to .claude/settings.local.json (Read → cache_read redirect)");
+    results.push("  [done] PreToolUse hook added to .claude/settings.local.json (Read → non-blocking cache_read reminder)");
   }
 
   // 5. .claude/settings.local.json MCP tool permissions (auto-approve cache_read + shell_cached)
@@ -574,7 +576,7 @@ function runStatus(root: string): void {
   lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read → cache_read redirect active" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read reminder active (non-blocking, allows native Read for Edit/Write)" : "not found — run augment-cc upgrade"}`);
   lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
@@ -593,10 +595,11 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "summarize") return runSummarize();
   if (command === "status") return runStatus(root);
   if (command === "redirect-read") {
-    process.stdout.write(JSON.stringify({
-      decision: "block",
-      reason: "augment-cc: use cache_read MCP tool instead of native Read — it provides session deduplication and mtime fast-path. Call cache_read with the same path argument. (If cache_read is unavailable because the MCP server is not connected, you may fall back to native Read.)",
-    }) + "\n");
+    process.stdout.write(
+      "augment-cc: For information gathering prefer cache_read (dedup returns a stub on re-reads, saving tokens). " +
+      "If you are about to call Edit or Write, proceed with this native Read — use offset + limit to read only the section you are changing. " +
+      "If cache_read returned a stub and context was lost to compaction, call cache_read with force: true to recover the full content before editing.\n"
+    );
     return;
   }
   process.stderr.write([
