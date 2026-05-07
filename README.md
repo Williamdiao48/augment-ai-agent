@@ -20,6 +20,8 @@ Built for heavy Claude Code usage where context compaction is a real constraint.
 | **Polyglot indexer** | JS/TS projects got deep extraction; Python, Go, Rust, Java, etc. got file-tree only — now all languages get symbol-level extraction |
 | **Session memory** | Prior sessions are summarized and injected on next start — Claude knows what changed last time |
 | **Decision extraction** | Session summaries capture *why* decisions were made, not just *what* changed — injected as "Key decisions" on next start |
+| **Tool enforcement** | Claude reverts to native Read after compaction — a PreToolUse hook redirects it to `cache_read` at the call site, surviving compaction |
+| **Codebase audit** | Claude writes duplicate utilities and bloated files when it can't see existing code health — audit injects project-specific warnings before each session |
 
 ---
 
@@ -198,7 +200,9 @@ augment-cc init
 ```
 augment-cc <command> [--project-root <path>]
 
-  init       Set up augment-cc in the current project (writes .mcp.json, CLAUDE.md, Stop hook)
+  init       Set up augment-cc in the current project (writes hooks + builds index + runs audit)
+  upgrade    Re-apply latest hook config without rebuilding the index (run after git pull)
+  audit      Scan for oversized files, duplicate function names, and high-export dumping-ground files
   inject     Print context injection block (used by CLAUDE.md hook)
   refresh    Force-rebuild the project index
   summarize  Parse session transcript and save summary (used by Stop hook)
@@ -206,6 +210,12 @@ augment-cc <command> [--project-root <path>]
 ```
 
 ```bash
+# Re-apply hook config after pulling updates (fast, no index rebuild)
+augment-cc upgrade
+
+# Run the codebase audit on demand (e.g. after a big refactor)
+augment-cc audit
+
 # Force a fresh index build (e.g. after adding new files)
 augment-cc refresh
 
@@ -268,10 +278,34 @@ All via environment variables (set in `.mcp.json` `env` block or shell):
 | `AUGMENT_CC_STALE_MS` | `3600000` (1h) | Age at which the project index is considered stale |
 | `AUGMENT_CC_MAX_SESSIONS` | `10` | Sessions to retain per project |
 | `AUGMENT_CC_INJECT_MAX_CHARS` | _(unlimited)_ | Cap total inject block size; trims the project index first, preserving git state and session summaries |
+| `AUGMENT_CC_COMPACTION_AGE_MS` | `900000` (15 min) | Age threshold before MCP sampling is used to check if file content is still in context |
+| `AUGMENT_CC_AUDIT_OVERSIZED_LINES` | `300` | Line count threshold for oversized file warning in audit |
+| `AUGMENT_CC_AUDIT_HIGH_EXPORTS` | `15` | Export count threshold for dumping-ground file warning in audit |
 
 To cap inject output for projects with very large indexes (e.g. many env vars):
 ```json
 "env": { "AUGMENT_CC_INJECT_MAX_CHARS": "8000" }
+```
+
+---
+
+## Codebase audit
+
+`augment-cc audit` (and `augment-cc init`) scans the project for three structural health signals and stores the results in SQLite. At the start of every session, the inject block includes a `## Code Health Warnings` section if any violations exist — giving Claude project-specific context before it writes anything. Clean codebases get no section.
+
+**Three warning classes:**
+
+| Warning | What it signals | Default threshold |
+|---|---|---|
+| Oversized files | File is too long to reason about as a unit — consider splitting | >300 lines |
+| Duplicate symbol names | Same function/type name exported from multiple files — likely redundancy | 2+ files |
+| High-export files | One file exports too many symbols — likely a utility dumping ground | >15 exports |
+
+The oversized check only applies to real source files (`.ts`, `.py`, `.go`, `.rs`, etc.) — generated files like `package-lock.json` are excluded. TypeScript function declarations are detected via regex (`export function`, `export const x = (`) since the TS indexer only captures interfaces and types.
+
+Run on demand after a large refactor:
+```bash
+augment-cc audit
 ```
 
 ---
