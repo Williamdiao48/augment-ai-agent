@@ -301,6 +301,7 @@ interface HookConfig {
   hasClaudeMd: boolean;
   hasStopHook: boolean;
   hasPreToolUseHook: boolean;
+  hasPostCompactHook: boolean;
   hasPermissions: boolean;
 }
 
@@ -337,8 +338,9 @@ function checkHookConfig(root: string): HookConfig {
     });
   } catch { /* missing */ }
 
-  // .claude/settings.local.json PreToolUse hook + MCP permissions
+  // .claude/settings.local.json PreToolUse hook + PostCompact hook + MCP permissions
   let hasPreToolUseHook = false;
+  let hasPostCompactHook = false;
   let hasPermissions = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
@@ -353,12 +355,21 @@ function checkHookConfig(root: string): HookConfig {
         return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
       });
     });
+    const postHooks = (Array.isArray(localHooks.PostCompact) ? localHooks.PostCompact : []) as unknown[];
+    hasPostCompactHook = postHooks.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+      });
+    });
     const localPerms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     const allowed = (Array.isArray(localPerms.allow) ? localPerms.allow : []) as string[];
     hasPermissions = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
   } catch { /* missing */ }
 
-  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook, hasPermissions };
+  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook, hasPostCompactHook, hasPermissions };
 }
 
 // ── init / upgrade shared config writer ───────────────────────────────────
@@ -477,6 +488,29 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve cache_read, shell_cached)");
   }
 
+  // 6. .claude/settings.local.json PostCompact hook (re-inject context after compaction)
+  if (!Array.isArray(localHooks.PostCompact)) localHooks.PostCompact = [];
+  const postCompactHooks = localHooks.PostCompact as unknown[];
+
+  const alreadyHasPostCompactHook = postCompactHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+    return inner?.some(h => {
+      const cmd = h.command as string | undefined;
+      return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+    });
+  });
+
+  if (alreadyHasPostCompactHook) {
+    results.push("  [skip] PostCompact hook already configured");
+  } else {
+    postCompactHooks.push({
+      matcher: "",
+      hooks: [{ type: "command", command: `node ${binPath} post-compact` }],
+    });
+    results.push("  [done] PostCompact hook added to .claude/settings.local.json (re-inject context after compaction)");
+  }
+
   mkdirSync(localSettingsDir, { recursive: true });
   writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
 
@@ -523,6 +557,29 @@ async function runUpgrade(root: string): Promise<void> {
   } else {
     process.stdout.write(`\naugment-cc upgrade — ${root}\n\n${results.join("\n")}\n\nRestart Claude Code to activate any new hooks.\n`);
   }
+}
+
+// ── post-compact ───────────────────────────────────────────────────────────
+
+async function runPostCompact(): Promise<void> {
+  let rawPayload = "";
+  try {
+    for await (const chunk of process.stdin) {
+      rawPayload += chunk as string;
+      if (rawPayload.length > 8 * 1024) break;
+    }
+  } catch { /* stdin may close immediately */ }
+
+  let payload: Record<string, unknown> = {};
+  try {
+    if (rawPayload.trim()) payload = JSON.parse(rawPayload) as Record<string, unknown>;
+  } catch { /* use cwd fallback */ }
+
+  const root = resolve((payload["cwd"] as string | undefined) ?? process.cwd());
+
+  process.stdout.write("[augment-cc: compaction detected — re-injecting project context]\n\n");
+  initIndexDb();
+  await runInject(root);
 }
 
 // ── deactivate ─────────────────────────────────────────────────────────────
@@ -597,6 +654,25 @@ async function runDeactivate(root: string): Promise<void> {
         results.push("  [done] Removed PreToolUse Read hook from .claude/settings.local.json");
       } else {
         results.push("  [skip] PreToolUse Read hook not found in .claude/settings.local.json");
+      }
+    }
+
+    // Remove PostCompact hook
+    if (Array.isArray(localHooks.PostCompact)) {
+      const before = (localHooks.PostCompact as unknown[]).length;
+      localHooks.PostCompact = (localHooks.PostCompact as unknown[]).filter((entry: unknown) => {
+        const e = entry as Record<string, unknown>;
+        const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+        return !inner?.some(h => {
+          const cmd = h.command as string | undefined;
+          return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+        });
+      });
+      if ((localHooks.PostCompact as unknown[]).length < before) {
+        changed = true;
+        results.push("  [done] Removed PostCompact hook from .claude/settings.local.json");
+      } else {
+        results.push("  [skip] PostCompact hook not found in .claude/settings.local.json");
       }
     }
 
@@ -679,6 +755,7 @@ function runStatus(root: string): void {
   lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read reminder active (non-blocking, allows native Read for Edit/Write)" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  PostCompact hook (settings.local):${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "re-inject active (fires after every compaction)" : "not found — run augment-cc upgrade"}`);
   lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
@@ -692,6 +769,7 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "init") return runInit(root);
   if (command === "upgrade") return runUpgrade(root);
   if (command === "deactivate") return runDeactivate(root);
+  if (command === "post-compact") return runPostCompact();
   if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
@@ -719,7 +797,8 @@ export async function runCli(argv: string[]): Promise<void> {
     "  refresh       Force-rebuild the project index",
     "  summarize     Parse session transcript and save summary (used by Stop hook)",
     "  status        Show cache stats, session history, and hook configuration",
-    "  redirect-read Output PreToolUse block decision (used by .claude/settings.local.json hook)",
+    "  redirect-read Output PreToolUse reminder (used by .claude/settings.local.json hook)",
+    "  post-compact  Re-inject project context after compaction (used by PostCompact hook)",
     "",
   ].join("\n"));
   process.exit(1);
