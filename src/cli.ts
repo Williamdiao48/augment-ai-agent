@@ -524,6 +524,107 @@ async function runUpgrade(root: string): Promise<void> {
   }
 }
 
+// ── deactivate ─────────────────────────────────────────────────────────────
+
+import { unlinkSync } from "fs";
+
+async function runDeactivate(root: string): Promise<void> {
+  const results: string[] = [];
+
+  // 1. .mcp.json — remove augment-cc server entry
+  const mcpPath = join(root, ".mcp.json");
+  try {
+    const mcpJson = JSON.parse(readFileSync(mcpPath, "utf-8")) as Record<string, unknown>;
+    const servers = (mcpJson.mcpServers ?? {}) as Record<string, unknown>;
+    if ("augment-cc" in servers) {
+      delete servers["augment-cc"];
+      mcpJson.mcpServers = servers;
+      writeFileSync(mcpPath, JSON.stringify(mcpJson, null, 2));
+      results.push("  [done] Removed augment-cc from .mcp.json");
+    } else {
+      results.push("  [skip] augment-cc not present in .mcp.json");
+    }
+  } catch {
+    results.push("  [skip] .mcp.json not found");
+  }
+
+  // 2. CLAUDE.md — remove inject line
+  const claudeMdPath = join(root, "CLAUDE.md");
+  try {
+    const content = readFileSync(claudeMdPath, "utf-8");
+    if (content.includes("augment-cc inject") || content.includes("dist/index.js inject")) {
+      const filtered = content
+        .split("\n")
+        .filter(l => !l.includes("augment-cc inject") && !l.includes("dist/index.js inject"))
+        .join("\n")
+        .replace(/^\n+/, ""); // trim leading blank lines left by removal
+      if (filtered.trim() === "") {
+        unlinkSync(claudeMdPath);
+        results.push("  [done] Deleted CLAUDE.md (was only the inject line)");
+      } else {
+        writeFileSync(claudeMdPath, filtered);
+        results.push("  [done] Removed inject line from CLAUDE.md");
+      }
+    } else {
+      results.push("  [skip] augment-cc inject line not found in CLAUDE.md");
+    }
+  } catch {
+    results.push("  [skip] CLAUDE.md not found");
+  }
+
+  // 3. .claude/settings.local.json — remove PreToolUse hook + MCP permissions
+  const localSettingsPath = join(root, ".claude", "settings.local.json");
+  try {
+    const localSettings = JSON.parse(readFileSync(localSettingsPath, "utf-8")) as Record<string, unknown>;
+    let changed = false;
+
+    // Remove PreToolUse Read hook
+    const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
+    if (Array.isArray(localHooks.PreToolUse)) {
+      const before = localHooks.PreToolUse.length;
+      localHooks.PreToolUse = (localHooks.PreToolUse as unknown[]).filter((entry: unknown) => {
+        const e = entry as Record<string, unknown>;
+        if ((e.matcher as string | undefined) !== "Read") return true;
+        const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+        return !inner?.some(h => {
+          const cmd = h.command as string | undefined;
+          return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+        });
+      });
+      if ((localHooks.PreToolUse as unknown[]).length < before) {
+        changed = true;
+        results.push("  [done] Removed PreToolUse Read hook from .claude/settings.local.json");
+      } else {
+        results.push("  [skip] PreToolUse Read hook not found in .claude/settings.local.json");
+      }
+    }
+
+    // Remove MCP permissions
+    const MCP_TOOLS = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"];
+    const perms = (localSettings.permissions ?? {}) as Record<string, unknown>;
+    if (Array.isArray(perms.allow)) {
+      const before = perms.allow.length;
+      perms.allow = (perms.allow as string[]).filter(t => !MCP_TOOLS.includes(t));
+      if ((perms.allow as string[]).length < before) {
+        changed = true;
+        results.push("  [done] Removed MCP tool permissions from .claude/settings.local.json");
+      } else {
+        results.push("  [skip] MCP tool permissions not found in .claude/settings.local.json");
+      }
+    }
+
+    if (changed) writeFileSync(localSettingsPath, JSON.stringify(localSettings, null, 2));
+  } catch {
+    results.push("  [skip] .claude/settings.local.json not found");
+  }
+
+  process.stdout.write(
+    `\naugment-cc deactivate — ${root}\n\n${results.join("\n")}\n\n` +
+    `Note: the Stop hook in ~/.claude/settings.json is global and was not removed.\n` +
+    `Run augment-cc init to re-activate.\n`
+  );
+}
+
 // ── status ─────────────────────────────────────────────────────────────────
 
 function runStatus(root: string): void {
@@ -589,6 +690,7 @@ export async function runCli(argv: string[]): Promise<void> {
   const root = parseProjectRoot(argv);
   if (command === "init") return runInit(root);
   if (command === "upgrade") return runUpgrade(root);
+  if (command === "deactivate") return runDeactivate(root);
   if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
@@ -610,6 +712,7 @@ export async function runCli(argv: string[]): Promise<void> {
     "Commands:",
     "  init          Set up augment-cc in the current project (writes hooks + builds index + audit)",
     "  upgrade       Re-apply latest hook config without rebuilding the index (run after git pull)",
+    "  deactivate    Remove augment-cc hooks from the current project (re-activate with init)",
     "  audit         Analyze codebase for oversized files, duplicate function names, and dumping-ground files",
     "  inject        Print context injection block (used by CLAUDE.md hook)",
     "  refresh       Force-rebuild the project index",
