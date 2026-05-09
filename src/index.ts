@@ -26,6 +26,8 @@ server.tool(
     keyword: z.string().optional().describe("Return only lines containing this term plus surrounding context. Use when you know what you're looking for — saves context vs reading the full file."),
     context_lines: z.number().optional().describe("Lines of context around each keyword match (default: 10)"),
     force: z.boolean().optional().describe("Re-inject full file content even if already read this session. Use when you know context was compacted and you need to recover the file."),
+    offset: z.number().optional().describe("Line number to start reading from, 0-based (default: 0). Use with limit for targeted reads before Edit/Write."),
+    limit: z.number().optional().describe("Number of lines to return (default: read to end of file). Use with offset for targeted reads."),
   },
   async (args) => {
     let samplingFn: ((prompt: string) => Promise<string>) | undefined;

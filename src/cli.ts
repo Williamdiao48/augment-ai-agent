@@ -1,7 +1,7 @@
 import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction } from "./indexer/db.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
@@ -579,6 +579,7 @@ async function runPostCompact(): Promise<void> {
 
   process.stdout.write("[augment-cc: compaction detected — re-injecting project context]\n\n");
   initIndexDb();
+  recordCompaction(root);
   await runInject(root);
 }
 

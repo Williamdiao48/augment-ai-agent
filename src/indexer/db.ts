@@ -68,6 +68,14 @@ export function initIndexDb(): void {
     db.exec("ALTER TABLE project_index ADD COLUMN audit_md TEXT");
     db.exec("ALTER TABLE project_index ADD COLUMN audited_at INTEGER");
   } catch { /* columns already exist */ }
+
+  // Phase 18b: compaction event log
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS compaction_events (
+      project_root TEXT NOT NULL,
+      compacted_at INTEGER NOT NULL
+    )
+  `);
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -239,6 +247,24 @@ export function saveAudit(projectRoot: string, auditJson: string, auditMd: strin
   getDb()
     .prepare("UPDATE project_index SET audit_json = ?, audit_md = ?, audited_at = ? WHERE project_root = ?")
     .run(auditJson, auditMd, Date.now(), projectRoot);
+}
+
+export function recordCompaction(projectRoot: string): void {
+  getDb().prepare("INSERT INTO compaction_events (project_root, compacted_at) VALUES (?, ?)").run(projectRoot, Date.now());
+}
+
+export function getLastCompaction(projectRoot: string): number | null {
+  const row = getDb()
+    .prepare("SELECT MAX(compacted_at) as compacted_at FROM compaction_events WHERE project_root = ?")
+    .get(projectRoot) as { compacted_at: number | null } | undefined;
+  return row?.compacted_at ?? null;
+}
+
+export function resetSessionReadBaseline(sessionId: string, filePath: string): void {
+  const now = Date.now();
+  getDb()
+    .prepare("UPDATE session_reads SET first_read_at = ?, last_read_at = ? WHERE session_id = ? AND file_path = ?")
+    .run(now, now, sessionId, filePath);
 }
 
 export function getStoredAudit(projectRoot: string): { audit_md: string; audited_at: number } | null {

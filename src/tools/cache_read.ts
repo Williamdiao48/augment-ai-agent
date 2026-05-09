@@ -2,7 +2,7 @@ import { readFileSync, statSync } from "fs";
 import { resolve, basename } from "path";
 import { createPatch } from "diff";
 import { hashContent, get, set } from "../cache.js";
-import { hasBeenRead, recordRead, refreshSessionHash } from "../indexer/db.js";
+import { hasBeenRead, recordRead, refreshSessionHash, resetSessionReadBaseline, getLastCompaction } from "../indexer/db.js";
 
 // ── Diff helper ───────────────────────────────────────────────────────────
 
@@ -86,6 +86,20 @@ function keywordExcerpt(raw: string, file: string, keyword: string, contextLines
   return `${header}\n\n${sections.join("\n\n---\n\n")}`;
 }
 
+function lineSlice(allLines: string[], offset: number, limit: number | undefined, file: string): string {
+  const total = allLines.length;
+  const start = Math.min(offset, total);
+  const end = limit !== undefined ? Math.min(start + limit, total) : total;
+
+  if (start >= total) {
+    return `[augment-cc: offset ${offset} is beyond end of ${file} (${total} lines)]`;
+  }
+
+  const header = `[augment-cc: lines ${start + 1}–${end} of ${file} (${total} total lines)]`;
+  const numbered = allLines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`).join("\n");
+  return `${header}\n\n${numbered}`;
+}
+
 export const cache_read_schema = {
   name: "cache_read",
   description:
@@ -109,6 +123,14 @@ export const cache_read_schema = {
         type: "boolean",
         description: "Re-inject full file content even if already read this session. Use when you know context was compacted and you need to recover the file.",
       },
+      offset: {
+        type: "number",
+        description: "Line number to start reading from, 0-based (default: 0). Use with limit for targeted reads.",
+      },
+      limit: {
+        type: "number",
+        description: "Number of lines to return (default: read to end of file).",
+      },
     },
     required: ["path"],
   },
@@ -118,6 +140,8 @@ export async function cache_read(args: {
   path: string;
   max_lines?: number;
   project_root?: string;
+  offset?: number;
+  limit?: number;
   _sessionId?: string;
   keyword?: string;
   context_lines?: number;
@@ -126,14 +150,24 @@ export async function cache_read(args: {
 }): Promise<string> {
   const absPath = resolve(args.project_root ?? process.cwd(), args.path);
   const maxLines = args.max_lines ?? 500;
+  const hasRange = args.offset !== undefined || args.limit !== undefined;
 
-  // Session-level dedup + diff-based change detection
-  if (args._sessionId) {
+  // Session-level dedup + diff-based change detection (skipped for offset/limit reads)
+  if (args._sessionId && !hasRange) {
     const prior = hasBeenRead(args._sessionId, absPath);
     if (prior) {
       recordRead(args._sessionId, absPath, prior.content_hash);
 
-      if (!args.force) {
+      // Detect whether compaction has occurred since this file was last read
+      let compactedAway = false;
+      if (!args.force && args.project_root) {
+        const lastCompaction = getLastCompaction(resolve(args.project_root));
+        if (lastCompaction !== null && prior.first_read_at < lastCompaction) {
+          compactedAway = true;
+        }
+      }
+
+      if (!args.force && !compactedAway) {
         const ageMs = Date.now() - prior.first_read_at;
         const ageStr = ageMs < 60_000
           ? `${Math.round(ageMs / 1000)}s ago`
@@ -179,6 +213,7 @@ export async function cache_read(args: {
 
       // File unchanged — return cached content directly
       if (cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
+        if (compactedAway) resetSessionReadBaseline(args._sessionId, absPath);
         return `[augment-cc: re-injecting ${basename(absPath)} (file unchanged)]\n\n${cached.value}`;
       }
 
@@ -195,6 +230,7 @@ export async function cache_read(args: {
       // Hash same → cosmetic write → update mtime, return cached content
       if (newHash === prior.content_hash) {
         if (cached) set(cacheKey, cached.value, { contentHash: newHash, fileMtime: currentMtime });
+        if (compactedAway) resetSessionReadBaseline(args._sessionId, absPath);
         return `[augment-cc: re-injecting ${basename(absPath)} (file unchanged)]\n\n${cached?.value ?? ""}`;
       }
 
@@ -208,6 +244,12 @@ export async function cache_read(args: {
 
       set(cacheKey, newContent, { contentHash: newHash, fileMtime: currentMtime });
       refreshSessionHash(args._sessionId, absPath, newHash);
+
+      // Compacted away + file changed: return full content (diff is useless without the "before" state)
+      if (compactedAway) {
+        resetSessionReadBaseline(args._sessionId, absPath);
+        return `[augment-cc: re-injecting ${basename(absPath)} (modified since last read)]\n\n${newContent}`;
+      }
 
       const diffText = computeDiff(oldContent, newContent, basename(absPath));
       return `[augment-cc: ${basename(absPath)} was modified since last read — showing diff]\n\n${diffText}`;
@@ -225,8 +267,8 @@ export async function cache_read(args: {
   const cached = get(cacheKey);
   const currentMtime = Math.floor(stat.mtimeMs);
 
-  // mtime fast-path: skip readFileSync entirely if mtime unchanged (not applicable to keyword mode)
-  if (!args.keyword && cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
+  // mtime fast-path: skip readFileSync if mtime unchanged (not applicable to keyword or hasRange mode)
+  if (!args.keyword && !hasRange && cached && cached.file_mtime !== null && cached.file_mtime === currentMtime) {
     if (args._sessionId) recordRead(args._sessionId, absPath, cached.content_hash ?? "");
     return `[cached] ${cached.value}`;
   }
@@ -237,6 +279,14 @@ export async function cache_read(args: {
     raw = readFileSync(absPath, "utf-8");
   } catch (e) {
     return `Error reading file: ${e}`;
+  }
+
+  // Offset/limit mode: slice raw content, register read, return immediately
+  if (hasRange) {
+    const allLines = raw.split("\n");
+    const currentHash = hashContent(raw);
+    if (args._sessionId) recordRead(args._sessionId, absPath, currentHash);
+    return lineSlice(allLines, args.offset ?? 0, args.limit, basename(absPath));
   }
 
   // Keyword excerpt mode: return targeted search results, skip full-read cache and dedup recording
