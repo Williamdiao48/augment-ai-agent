@@ -4,10 +4,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { cache_read } from "./tools/cache_read.js";
 import { shell_cached } from "./tools/shell_cached.js";
+import { run_saved_command } from "./tools/run_saved_command.js";
 import { stats } from "./cache.js";
 import { IndexerService, getProjectIndex } from "./indexer/index.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
-import { initIndexDb, pruneOldSessionReads } from "./indexer/db.js";
+import { initIndexDb, pruneOldSessionReads, pruneOldCommandRuns, saveCommand } from "./indexer/db.js";
 
 const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -56,7 +57,36 @@ server.tool(
     max_output_chars: z.number().optional().describe("Truncate output to N chars (default: 8000)"),
   },
   async (args) => ({
-    content: [{ type: "text", text: await shell_cached(args) }],
+    content: [{ type: "text", text: await shell_cached({ ...args, _projectRoot: process.cwd() }) }],
+  })
+);
+
+server.tool(
+  "save_command",
+  "Save a bash script under a short name for quick reuse across sessions. Saved commands appear in the Script Library section of the project index at every session start and can be run instantly with run_saved_command.",
+  {
+    name: z.string().describe("Short identifier for this script (e.g. 'git_recent', 'run_tests'). Use snake_case."),
+    script: z.string().describe("The bash script or command to save"),
+    description: z.string().describe("One-line description of what this script does"),
+  },
+  async (args) => {
+    saveCommand(process.cwd(), args.name, args.script, args.description);
+    return {
+      content: [{ type: "text", text: `[augment-cc: saved command "${args.name}" — available immediately via run_saved_command("${args.name}") and will appear in the Script Library at next session start]` }],
+    };
+  }
+);
+
+server.tool(
+  "run_saved_command",
+  "Run a previously saved project script by name. Scripts are listed in the Script Library section of the project index. Always returns live output (no TTL caching).",
+  {
+    name: z.string().describe("Name of the saved command to run"),
+    cwd: z.string().optional().describe("Working directory (default: project root)"),
+    max_output_chars: z.number().optional().describe("Truncate output to N chars (default: 8000)"),
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await run_saved_command({ ...args, _projectRoot: process.cwd() }) }],
   })
 );
 
@@ -106,6 +136,7 @@ async function main() {
 
   initIndexDb();
   pruneOldSessionReads();
+  pruneOldCommandRuns();
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

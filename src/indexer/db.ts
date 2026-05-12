@@ -76,6 +76,28 @@ export function initIndexDb(): void {
       compacted_at INTEGER NOT NULL
     )
   `);
+
+  // Phase 19: named script library
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS command_runs (
+      project_root  TEXT NOT NULL,
+      command_hash  TEXT NOT NULL,
+      command       TEXT NOT NULL,
+      run_count     INTEGER NOT NULL DEFAULT 1,
+      last_run_at   INTEGER NOT NULL,
+      PRIMARY KEY (project_root, command_hash)
+    );
+
+    CREATE TABLE IF NOT EXISTS saved_commands (
+      project_root  TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      script        TEXT NOT NULL,
+      description   TEXT NOT NULL,
+      created_at    INTEGER NOT NULL,
+      run_count     INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (project_root, name)
+    );
+  `);
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -278,4 +300,73 @@ export function getStoredAudit(projectRoot: string): { audit_md: string; audited
 
 function safeJsonParse(s: string): string[] {
   try { return JSON.parse(s) as string[]; } catch { return []; }
+}
+
+// ── Phase 19: named script library ────────────────────────────────────────────
+
+export function recordCommandRun(projectRoot: string, commandHash: string, command: string): void {
+  const now = Date.now();
+  getDb()
+    .prepare(`
+      INSERT INTO command_runs (project_root, command_hash, command, run_count, last_run_at)
+      VALUES (?, ?, ?, 1, ?)
+      ON CONFLICT(project_root, command_hash) DO UPDATE SET
+        run_count = run_count + 1,
+        last_run_at = excluded.last_run_at
+    `)
+    .run(projectRoot, commandHash, command, now);
+}
+
+export function getTopCommandRuns(
+  projectRoot: string,
+  limit: number,
+  excludeScripts: string[] = [],
+): Array<{ command: string; run_count: number }> {
+  type Row = { command: string; run_count: number };
+  const rows = getDb()
+    .prepare(`
+      SELECT command, run_count FROM command_runs
+      WHERE project_root = ?
+      ORDER BY run_count DESC LIMIT ?
+    `)
+    .all(projectRoot, limit * 2) as Row[];
+  return rows.filter(r => !excludeScripts.includes(r.command)).slice(0, limit);
+}
+
+export function saveCommand(projectRoot: string, name: string, script: string, description: string): void {
+  getDb()
+    .prepare(`
+      INSERT INTO saved_commands (project_root, name, script, description, created_at, run_count)
+      VALUES (?, ?, ?, ?, ?, 0)
+      ON CONFLICT(project_root, name) DO UPDATE SET
+        script = excluded.script,
+        description = excluded.description
+    `)
+    .run(projectRoot, name, script, description, Date.now());
+}
+
+export function getCommand(projectRoot: string, name: string): { script: string; description: string } | null {
+  type Row = { script: string; description: string };
+  return (getDb()
+    .prepare("SELECT script, description FROM saved_commands WHERE project_root = ? AND name = ?")
+    .get(projectRoot, name) as Row | undefined) ?? null;
+}
+
+export function getAllSavedCommands(projectRoot: string): Array<{ name: string; script: string; description: string; run_count: number }> {
+  type Row = { name: string; script: string; description: string; run_count: number };
+  return getDb()
+    .prepare("SELECT name, script, description, run_count FROM saved_commands WHERE project_root = ? ORDER BY run_count DESC, name ASC")
+    .all(projectRoot) as Row[];
+}
+
+export function incrementSavedCommandRun(projectRoot: string, name: string): void {
+  getDb()
+    .prepare("UPDATE saved_commands SET run_count = run_count + 1 WHERE project_root = ? AND name = ?")
+    .run(projectRoot, name);
+}
+
+export function pruneOldCommandRuns(maxAgeMs: number = 30 * 24 * 3600 * 1000): void {
+  getDb()
+    .prepare("DELETE FROM command_runs WHERE last_run_at < ?")
+    .run(Date.now() - maxAgeMs);
 }

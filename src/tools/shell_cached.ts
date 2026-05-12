@@ -1,5 +1,6 @@
 import { execSync } from "child_process";
-import { get, set } from "../cache.js";
+import { get, set, hashContent } from "../cache.js";
+import { recordCommandRun } from "../indexer/db.js";
 
 // ── Output filters ─────────────────────────────────────────────────────────
 
@@ -108,6 +109,7 @@ export async function shell_cached(args: {
   cwd?: string;
   ttl_ms?: number;
   max_output_chars?: number;
+  _projectRoot?: string;
 }): Promise<string> {
   const cwd = args.cwd ?? process.cwd();
   const maxChars = args.max_output_chars ?? 8_000;
@@ -132,6 +134,12 @@ export async function shell_cached(args: {
   } catch (e: unknown) {
     const err = e as { stdout?: string; stderr?: string; message?: string };
     output = err.stdout ?? err.stderr ?? err.message ?? String(e);
+  }
+
+  if (args._projectRoot) {
+    try {
+      recordCommandRun(args._projectRoot, hashContent(args.command).slice(0, 16), args.command);
+    } catch { /* db may not be initialized in test contexts */ }
   }
 
   output = stripAnsi(output);

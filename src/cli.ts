@@ -1,7 +1,7 @@
 import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
@@ -70,6 +70,38 @@ function formatHighValueFiles(files: Array<{ file_path: string; session_count: n
   return lines.join("\n");
 }
 
+// ── script library formatter ───────────────────────────────────────────────
+
+function formatScriptLibrary(
+  saved: Array<{ name: string; description: string; run_count: number }>,
+  frequent: Array<{ command: string; run_count: number }>,
+): string | null {
+  if (saved.length === 0 && frequent.length === 0) return null;
+
+  const lines: string[] = [];
+
+  if (saved.length > 0) {
+    lines.push("## Script Library", "");
+    for (const s of saved) {
+      lines.push(`- \`${s.name}\` — ${s.description}`);
+    }
+    lines.push("");
+    lines.push("Run any of these with `run_saved_command(name)`.");
+  }
+
+  if (frequent.length > 0) {
+    lines.push("", "## Frequently Run Commands (not yet saved)", "");
+    for (const f of frequent) {
+      const preview = f.command.length > 60 ? f.command.slice(0, 60) + "…" : f.command;
+      lines.push(`- \`${preview}\` (${f.run_count}×)`);
+    }
+    lines.push("");
+    lines.push("Use `save_command(name, script, description)` to save any of these for quick reuse.");
+  }
+
+  return lines.join("\n").trimEnd();
+}
+
 // ── session formatter ──────────────────────────────────────────────────────
 
 function formatSessions(sessions: SessionEntry[]): string | null {
@@ -121,11 +153,16 @@ async function runInject(root: string): Promise<void> {
     "**If `cache_read` returns a stub and you have lost context to compaction:** call `cache_read` with `force: true` to recover the full file before editing.",
     "**If you lose project context (schema, routes, types, file tree) to compaction:** read the `project://index` MCP resource to recover the full project index without re-reading individual files.",
     "**Always use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
+    "**Use `run_saved_command(name)` for any script in the Script Library.** Check the Script Library section below for available scripts. Use `save_command(name, script, description)` to save a new one for future sessions.",
   ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
+  const savedCmds = getAllSavedCommands(root);
+  const savedScripts = savedCmds.map(c => c.script);
+  const frequentCmds = getTopCommandRuns(root, 5, savedScripts);
+  const scriptLibraryBlock = formatScriptLibrary(savedCmds, frequentCmds);
 
   if (!stored) {
-    const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
+    const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, scriptLibraryBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -160,7 +197,7 @@ async function runInject(root: string): Promise<void> {
   const auditStored = getStoredAudit(root);
   const auditBlock = auditStored?.audit_md || null;
 
-  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
+  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, scriptLibraryBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
