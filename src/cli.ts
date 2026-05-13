@@ -102,6 +102,24 @@ function formatScriptLibrary(
   return lines.join("\n").trimEnd();
 }
 
+// ── file tree formatter (used when full index is skipped) ──────────────────
+
+function formatFileTreeBlock(index: ProjectIndex): string {
+  const { fileTree } = index;
+  const lines: string[] = [
+    `# Project Index`,
+    `Root: \`${index.projectRoot}\` | Files: ${fileTree.totalFiles}`,
+  ];
+  if (fileTree.topDirs.length) lines.push(`Dirs: ${fileTree.topDirs.join("  ")}`);
+  const extSummary = Object.entries(fileTree.byExtension)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([ext, n]) => `${ext}(${n})`)
+    .join("  ");
+  if (extSummary) lines.push(`Exts: ${extSummary}`);
+  return lines.join("\n");
+}
+
 // ── session formatter ──────────────────────────────────────────────────────
 
 function formatSessions(sessions: SessionEntry[]): string | null {
@@ -165,30 +183,27 @@ async function runInject(root: string): Promise<void> {
     + index.routes.fastapi.length + index.routes.rails.length;
   const typeCount = index.types.tsInterfaces.length + index.types.graphqlTypes.length;
   const hasMeaningful = modelCount + routeCount + typeCount + index.docker.length
-    + (index.python?.length ?? 0) + (index.declarations?.length ?? 0) > 0;
+    + (index.python?.length ?? 0) > 0;
 
-  const qualityNote = hasMeaningful
-    ? null
-    : `<!-- augment-cc: index is file-tree only (detected: ${index.detectedTypes.join(", ") || "none"}) — project may use unrecognized frameworks. Don't over-trust this index. -->`;
+  if (!hasMeaningful) {
+    const treeBlock = formatFileTreeBlock(index);
+    const noSchemaNote = `<!-- augment-cc: no recognized schema/routes detected — explore files directly or run \`augment-cc refresh\` after adding a supported framework -->`;
+    const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, treeBlock, noSchemaNote].filter(Boolean);
+    process.stdout.write(parts.join("\n\n") + "\n");
+    return;
+  }
 
-  const MAX_CHARS = Number(process.env.AUGMENT_CC_INJECT_MAX_CHARS ?? 0);
+  const INDEX_MAX_CHARS = Number(process.env.AUGMENT_CC_INJECT_MAX_CHARS ?? 6_000);
   let indexBlock: string | null = stored.index_md;
-  if (MAX_CHARS > 0) {
-    const fixedChars = [sessionBlock, gitBlock, highValueBlock, qualityNote]
-      .filter(Boolean)
-      .join("\n\n").length;
-    const indexBudget = MAX_CHARS - fixedChars - 4;
-    if (indexBudget <= 0) {
-      indexBlock = `[augment-cc: index omitted — AUGMENT_CC_INJECT_MAX_CHARS budget exhausted by other sections]`;
-    } else if (indexBlock.length > indexBudget) {
-      indexBlock = indexBlock.slice(0, indexBudget) + `\n[augment-cc: index truncated — increase AUGMENT_CC_INJECT_MAX_CHARS to see more]`;
-    }
+  if (indexBlock && indexBlock.length > INDEX_MAX_CHARS) {
+    indexBlock = indexBlock.slice(0, INDEX_MAX_CHARS) +
+      `\n[augment-cc: index truncated at ${INDEX_MAX_CHARS} chars — read the \`project://index\` MCP resource for the full index]`;
   }
 
   const auditStored = getStoredAudit(root);
   const auditBlock = auditStored?.audit_md || null;
 
-  const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
+  const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 

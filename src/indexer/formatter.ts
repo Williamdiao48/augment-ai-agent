@@ -9,8 +9,6 @@ const MAX_TYPE_MEMBERS = 4;
 const MAX_GQL_FIELDS = 4;
 const MAX_PYTHON_FILES = 10;
 const MAX_PYTHON_SYMBOLS_PER_FILE = 5;
-const MAX_GENERIC_FILES = 10;
-const MAX_GENERIC_PER_FILE = 5;
 const MAX_ENV = 20;
 const PLACEHOLDER_RE = /^(?:your[-_]|<[^>]+>|x{3,}|change[-_]?me|placeholder|todo|replace|example\.com)/i;
 
@@ -29,6 +27,17 @@ export function formatIndex(index: ProjectIndex): string {
     `# Project Index`,
     `Root: \`${index.projectRoot}\` | Files: ${index.fileTree.totalFiles} | Built: ${new Date(index.builtAt).toISOString()}`,
   );
+
+  // --- File Tree (always first — compact, visible even when index is capped) ---
+  const { fileTree } = index;
+  sections.push("", "## File Tree");
+  if (fileTree.topDirs.length) sections.push(`Dirs: ${fileTree.topDirs.join("  ")}`);
+  const extSummary = Object.entries(fileTree.byExtension)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([ext, n]) => `${ext}(${n})`)
+    .join("  ");
+  if (extSummary) sections.push(`Exts: ${extSummary}`);
 
   // --- DB Schema ---
   const { db } = index;
@@ -190,51 +199,6 @@ export function formatIndex(index: ProjectIndex): string {
       sections.push(`- ${s.name} (${s.image})${ports}${deps}`);
     }
   }
-
-  // --- Generic Declarations ---
-  if (index.declarations.length) {
-    const byFile = new Map<string, typeof index.declarations>();
-    for (const sym of index.declarations) {
-      if (!byFile.has(sym.sourceFile)) byFile.set(sym.sourceFile, []);
-      byFile.get(sym.sourceFile)!.push(sym);
-    }
-    const extLangMap: Record<string, string> = {
-      ".go": "Go", ".rs": "Rust", ".java": "Java", ".rb": "Ruby",
-      ".cpp": "C++", ".hpp": "C++", ".c": "C", ".h": "C/C++",
-      ".kt": "Kotlin", ".php": "PHP", ".cs": "C#", ".swift": "Swift",
-      ".scala": "Scala", ".ex": "Elixir", ".exs": "Elixir",
-    };
-    const langCounts: Record<string, number> = {};
-    for (const sym of index.declarations) {
-      const ext = sym.sourceFile.slice(sym.sourceFile.lastIndexOf("."));
-      const lang = extLangMap[ext] ?? ext;
-      langCounts[lang] = (langCounts[lang] ?? 0) + 1;
-    }
-    const langs = Object.entries(langCounts).sort((a, b) => b[1] - a[1]).map(([l]) => l).join(", ");
-    const fileRest = Math.max(0, byFile.size - MAX_GENERIC_FILES);
-    sections.push("", `## Declarations (${langs} — ${byFile.size} files, ${index.declarations.length} symbols${fileRest > 0 ? ` [+${fileRest} more files]` : ""})`);
-
-    let filesShown = 0;
-    for (const [filePath, syms] of byFile) {
-      if (filesShown >= MAX_GENERIC_FILES) break;
-      filesShown++;
-      const rel = relative(index.projectRoot, filePath) || basename(filePath);
-      const { shown, rest } = truncateList(syms, MAX_GENERIC_PER_FILE);
-      const symStr = shown.map((s) => `${s.keyword} ${s.name}`).join(", ");
-      sections.push(`- ${rel}: ${symStr}${rest > 0 ? ` [+${rest} more]` : ""}`);
-    }
-  }
-
-  // --- File Tree ---
-  const { fileTree } = index;
-  sections.push("", "## File Tree");
-  if (fileTree.topDirs.length) sections.push(`Dirs: ${fileTree.topDirs.join("  ")}`);
-  const extSummary = Object.entries(fileTree.byExtension)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8)
-    .map(([ext, n]) => `${ext}(${n})`)
-    .join("  ");
-  if (extSummary) sections.push(`Exts: ${extSummary}`);
 
   return sections.join("\n");
 }
