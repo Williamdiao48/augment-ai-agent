@@ -1,6 +1,7 @@
 import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { execSync } from "child_process";
 import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
@@ -132,9 +133,8 @@ function formatSessions(sessions: SessionEntry[]): string | null {
     const titlePart = s.aiTitle ? ` — ${s.aiTitle}` : "";
     lines.push(`### ${date} (${dur} on \`${s.branch}\`)${titlePart}`);
     lines.push(s.summary);
-    if (s.decisions.length > 0) {
-      const excerpts = s.decisions.map(d => `"${d}"`).join(" — ");
-      lines.push(`Key decisions: ${excerpts}`);
+    if (s.closingNotes.length > 0) {
+      lines.push(`Concluded: "${s.closingNotes[s.closingNotes.length - 1]}"`);
     }
     const allFiles = [...s.filesCreated, ...s.filesModified];
     if (allFiles.length > 0) {
@@ -201,7 +201,16 @@ async function runInject(root: string): Promise<void> {
   }
 
   const auditStored = getStoredAudit(root);
-  const auditBlock = auditStored?.audit_md || null;
+  let auditBlock: string | null = null;
+  if (auditStored) {
+    const AUDIT_MAX_AGE_MS = 14 * 24 * 3600 * 1000;
+    if (Date.now() - auditStored.audited_at <= AUDIT_MAX_AGE_MS) {
+      auditBlock = auditStored.audit_md;
+    } else {
+      const daysSince = Math.round((Date.now() - auditStored.audited_at) / (24 * 3600 * 1000));
+      auditBlock = `<!-- augment-cc: last audit was ${daysSince} days ago — run \`augment-cc audit\` to refresh -->`;
+    }
+  }
 
   const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
@@ -313,7 +322,25 @@ async function runSummarize(): Promise<void> {
   // 5. Summarize via structured extraction
   const summary = buildStructuredSummary(facts);
 
-  // 6. Persist
+  // 6. Generate session title: try claude -p, fall back to first user message words
+  let aiTitle: string | null = facts.aiTitle;
+  if (!aiTitle) {
+    try {
+      const prompt = `Give a 4-6 word title for this work session. Reply with ONLY the title, no quotes or punctuation at end. Session: ${summary.slice(0, 300)}`;
+      const raw = execSync(`claude -p ${JSON.stringify(prompt)}`, {
+        encoding: "utf-8",
+        timeout: 10_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim().replace(/^["']|["']$/g, "");
+      if (raw.length > 0 && raw.length < 80) aiTitle = raw;
+    } catch { /* claude CLI unavailable or timed out */ }
+  }
+  if (!aiTitle && facts.firstUserMessage) {
+    const words = facts.firstUserMessage.trim().split(/\s+/);
+    aiTitle = words.slice(0, 8).join(" ") + (words.length > 8 ? "…" : "");
+  }
+
+  // 7. Persist
   initIndexDb();
   const entry: SessionEntry = {
     sessionId: facts.sessionId,
@@ -327,8 +354,8 @@ async function runSummarize(): Promise<void> {
     filesModified: facts.filesModified,
     commandsRun: facts.commandsRun,
     messageCount: facts.messageCount,
-    aiTitle: facts.aiTitle,
-    decisions: facts.decisions,
+    aiTitle,
+    closingNotes: facts.closingNotes,
     createdAt: Date.now(),
   };
   saveSession(entry);

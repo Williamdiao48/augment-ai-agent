@@ -62,6 +62,11 @@ export function initIndexDb(): void {
     db.exec("ALTER TABLE sessions ADD COLUMN decisions TEXT NOT NULL DEFAULT '[]'");
   } catch { /* column already exists */ }
 
+  // Phase 23 migration: add closing_notes column (replaces keyword-regex decisions)
+  try {
+    db.exec("ALTER TABLE sessions ADD COLUMN closing_notes TEXT NOT NULL DEFAULT '[]'");
+  } catch { /* column already exists */ }
+
   // Phase 14 migration: add audit columns to project_index
   try {
     db.exec("ALTER TABLE project_index ADD COLUMN audit_json TEXT");
@@ -144,7 +149,7 @@ export function saveSession(entry: SessionEntry): void {
       INSERT OR REPLACE INTO sessions
         (session_id, project_root, started_at, ended_at, duration_secs,
          branch, summary, files_created, files_modified, commands_run,
-         message_count, ai_title, decisions, created_at)
+         message_count, ai_title, closing_notes, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
@@ -160,7 +165,7 @@ export function saveSession(entry: SessionEntry): void {
       JSON.stringify(entry.commandsRun),
       entry.messageCount,
       entry.aiTitle ?? null,
-      JSON.stringify(entry.decisions),
+      JSON.stringify(entry.closingNotes),
       entry.createdAt,
     );
   pruneOldSessions(entry.projectRoot, MAX_SESSIONS);
@@ -171,13 +176,13 @@ export function getRecentSessions(projectRoot: string, limit: number): SessionEn
     session_id: string; project_root: string; started_at: number; ended_at: number;
     duration_secs: number; branch: string; summary: string; files_created: string;
     files_modified: string; commands_run: string; message_count: number;
-    ai_title: string | null; decisions: string; created_at: number;
+    ai_title: string | null; closing_notes: string; created_at: number;
   };
   const rows = getDb()
     .prepare(`
       SELECT session_id, project_root, started_at, ended_at, duration_secs,
              branch, summary, files_created, files_modified, commands_run,
-             message_count, ai_title, decisions, created_at
+             message_count, ai_title, closing_notes, created_at
       FROM sessions WHERE project_root = ?
       ORDER BY started_at DESC LIMIT ?
     `)
@@ -196,7 +201,7 @@ export function getRecentSessions(projectRoot: string, limit: number): SessionEn
     commandsRun: safeJsonParse(r.commands_run),
     messageCount: r.message_count,
     aiTitle: r.ai_title,
-    decisions: safeJsonParse(r.decisions),
+    closingNotes: safeJsonParse(r.closing_notes),
     createdAt: r.created_at,
   }));
 }

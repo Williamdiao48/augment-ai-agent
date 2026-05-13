@@ -198,7 +198,7 @@ export interface TranscriptFacts {
   commandsRun: string[];
   messageCount: number;
   aiTitle: string | null;
-  decisions: string[];
+  closingNotes: string[];
 }
 
 // Persisted in SQLite `sessions` table
@@ -215,6 +215,6 @@ export interface SessionEntry {
   commandsRun: string[];
   messageCount: number;
   aiTitle: string | null;
-  decisions: string[];
+  closingNotes: string[];
   createdAt: number;
 }

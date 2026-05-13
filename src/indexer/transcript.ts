@@ -5,28 +5,6 @@ import type { TranscriptFacts } from "./types.js";
 const BASH_NOISE_RE =
   /^\s*(cat|head|tail|less|more|bat|echo|ls|pwd|which|file|stat)\b|^\s*git\s+(status|diff|log|show|branch|remote|fetch)\s*$|^\s*(find|grep|rg|fd)\s|^\s*node\s+--version\b|^\s*npm\s+(list|ls)\b/;
 
-const DECISION_MARKERS = [
-  "instead of", "rather than", "the reason", "we decided", "decided to",
-  "alternative would be", "opted for", "chose to", "trade-off", "tradeoff",
-];
-const MAX_DECISIONS = 3;
-const MAX_DECISION_LEN = 200;
-
-function extractDecisionExcerpts(text: string, remaining: number): string[] {
-  if (remaining <= 0) return [];
-  const segments = text.replace(/\. (?=[A-Z])/g, ".\n").split(/\n+/);
-  const found: string[] = [];
-  for (const seg of segments) {
-    if (found.length >= remaining) break;
-    const trimmed = seg.trim();
-    if (trimmed.length < 20) continue;
-    const lower = trimmed.toLowerCase();
-    if (DECISION_MARKERS.some(m => lower.includes(m))) {
-      found.push(trimmed.slice(0, MAX_DECISION_LEN));
-    }
-  }
-  return found;
-}
 
 function parseTimestamp(ts: unknown): number | null {
   if (typeof ts !== "string") return null;
@@ -71,7 +49,7 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
   const commandsRun: string[] = [];
   let messageCount = 0;
   let aiTitle: string | null = null;
-  const decisions: string[] = [];
+  const allAssistantTexts: string[] = [];
 
   for (const obj of parsed) {
     if (typeof obj !== "object" || obj === null) continue;
@@ -116,8 +94,8 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
         const b = block as Record<string, unknown>;
         if (b["type"] === "text" && typeof b["text"] === "string") {
           lastAssistantText = b["text"].slice(0, 400); // keep updating — last wins
-          if (decisions.length < MAX_DECISIONS) {
-            decisions.push(...extractDecisionExcerpts(b["text"], MAX_DECISIONS - decisions.length));
+          if (b["text"].length > 100) {
+            allAssistantTexts.push(b["text"].slice(0, 300));
           }
         }
         if (b["type"] === "tool_use") {
@@ -146,6 +124,7 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
 
   // Write takes precedence over Edit for the same file
   const modifiedOnly = [...filesModified].filter(p => !filesCreated.has(p));
+  const closingNotes = allAssistantTexts.slice(-2);
 
   return {
     sessionId,
@@ -161,6 +140,6 @@ export async function parseTranscript(transcriptPath: string): Promise<Transcrip
     commandsRun,
     messageCount,
     aiTitle,
-    decisions,
+    closingNotes,
   };
 }

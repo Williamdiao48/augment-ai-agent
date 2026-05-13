@@ -56,6 +56,13 @@ export async function runCodeAudit(root: string): Promise<{ result: AuditResult;
   const symbolsByFile = new Map<string, Set<string>>();
   const nameToFiles   = new Map<string, Set<string>>();
 
+  // Track interface/type-only exports per file (for barrel file detection)
+  const interfacesByFile = new Map<string, Set<string>>();
+  for (const sym of index.types?.tsInterfaces ?? []) {
+    if (!interfacesByFile.has(sym.sourceFile)) interfacesByFile.set(sym.sourceFile, new Set());
+    interfacesByFile.get(sym.sourceFile)!.add(sym.name);
+  }
+
   // From index: function-type declarations (Go, Rust, Java, Python, etc.)
   for (const sym of index.declarations ?? []) {
     if (FUNCTION_KEYWORDS.has(sym.keyword.toLowerCase())) {
@@ -117,6 +124,8 @@ export async function runCodeAudit(root: string): Promise<{ result: AuditResult;
   const highExportFiles: AuditResult["highExportFiles"] = [];
   for (const [absPath, syms] of symbolsByFile) {
     if (syms.size > HIGH_EXPORTS) {
+      const interfaceCount = interfacesByFile.get(absPath)?.size ?? 0;
+      if (interfaceCount / syms.size > 0.8) continue; // barrel file — skip
       highExportFiles.push({ path: relative(root, absPath), exportCount: syms.size });
     }
   }
