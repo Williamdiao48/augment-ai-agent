@@ -146,15 +146,6 @@ async function runInject(root: string): Promise<void> {
   }
 
   const gitBlock = formatGitState(getGitState(root));
-  const toolPrefs = [
-    "## augment-cc Tool Rules",
-    "**Use `cache_read` for information gathering** (exploring code, reading for context or reference). It deduplicates re-reads — unchanged files return a ~120-char stub instead of re-injecting full content.",
-    "**Before Edit or Write: use native Read with `offset` + `limit`** scoped to just the lines you are changing. This satisfies the tool requirement at minimal token cost. Do not use native Read for information gathering.",
-    "**If `cache_read` returns a stub and you have lost context to compaction:** call `cache_read` with `force: true` to recover the full file before editing.",
-    "**If you lose project context (schema, routes, types, file tree) to compaction:** read the `project://index` MCP resource to recover the full project index without re-reading individual files.",
-    "**Always use `shell_cached` for read-only shell commands** (git log, git status, find, ls).",
-    "**Use `run_saved_command(name)` for any script in the Script Library.** Check the Script Library section below for available scripts. Use `save_command(name, script, description)` to save a new one for future sessions.",
-  ].join("\n");
   const highValueBlock = formatHighValueFiles(getTopReadFiles(root, 5));
   const savedCmds = getAllSavedCommands(root);
   const savedScripts = savedCmds.map(c => c.script);
@@ -162,7 +153,7 @@ async function runInject(root: string): Promise<void> {
   const scriptLibraryBlock = formatScriptLibrary(savedCmds, frequentCmds);
 
   if (!stored) {
-    const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, scriptLibraryBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
+    const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -183,7 +174,7 @@ async function runInject(root: string): Promise<void> {
   const MAX_CHARS = Number(process.env.AUGMENT_CC_INJECT_MAX_CHARS ?? 0);
   let indexBlock: string | null = stored.index_md;
   if (MAX_CHARS > 0) {
-    const fixedChars = [sessionBlock, gitBlock, toolPrefs, highValueBlock, qualityNote]
+    const fixedChars = [sessionBlock, gitBlock, highValueBlock, qualityNote]
       .filter(Boolean)
       .join("\n\n").length;
     const indexBudget = MAX_CHARS - fixedChars - 4;
@@ -197,7 +188,7 @@ async function runInject(root: string): Promise<void> {
   const auditStored = getStoredAudit(root);
   const auditBlock = auditStored?.audit_md || null;
 
-  const parts = [sessionBlock, gitBlock, toolPrefs, highValueBlock, scriptLibraryBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
+  const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, qualityNote, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
@@ -336,8 +327,8 @@ async function runSummarize(): Promise<void> {
 interface HookConfig {
   hasMcp: boolean;
   hasClaudeMd: boolean;
+  hasStaticRules: boolean;
   hasStopHook: boolean;
-  hasPreToolUseHook: boolean;
   hasPostCompactHook: boolean;
   hasPermissions: boolean;
 }
@@ -353,9 +344,11 @@ function checkHookConfig(root: string): HookConfig {
 
   // CLAUDE.md
   let hasClaudeMd = false;
+  let hasStaticRules = false;
   try {
     const md = readFileSync(join(root, "CLAUDE.md"), "utf-8");
     hasClaudeMd = md.includes("augment-cc inject") || md.includes("dist/index.js inject");
+    hasStaticRules = md.includes("<!-- augment-cc:rules:start -->");
   } catch { /* missing */ }
 
   // ~/.claude/settings.json Stop hook
@@ -375,23 +368,12 @@ function checkHookConfig(root: string): HookConfig {
     });
   } catch { /* missing */ }
 
-  // .claude/settings.local.json PreToolUse hook + PostCompact hook + MCP permissions
-  let hasPreToolUseHook = false;
+  // .claude/settings.local.json PostCompact hook + MCP permissions
   let hasPostCompactHook = false;
   let hasPermissions = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
     const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
-    const preHooks = (Array.isArray(localHooks.PreToolUse) ? localHooks.PreToolUse : []) as unknown[];
-    hasPreToolUseHook = preHooks.some((entry: unknown) => {
-      const e = entry as Record<string, unknown>;
-      if ((e.matcher as string | undefined) !== "Read") return false;
-      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
-      return inner?.some(h => {
-        const cmd = h.command as string | undefined;
-        return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
-      });
-    });
     const postHooks = (Array.isArray(localHooks.PostCompact) ? localHooks.PostCompact : []) as unknown[];
     hasPostCompactHook = postHooks.some((entry: unknown) => {
       const e = entry as Record<string, unknown>;
@@ -406,7 +388,7 @@ function checkHookConfig(root: string): HookConfig {
     hasPermissions = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
   } catch { /* missing */ }
 
-  return { hasMcp, hasClaudeMd, hasStopHook, hasPreToolUseHook, hasPostCompactHook, hasPermissions };
+  return { hasMcp, hasClaudeMd, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions };
 }
 
 // ── init / upgrade shared config writer ───────────────────────────────────
@@ -482,7 +464,40 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [done] Stop hook added to ~/.claude/settings.json");
   }
 
-  // 4. .claude/settings.local.json PreToolUse hook (project-level, blocks native Read)
+  // 2b. CLAUDE.md static rules section (idempotent update by delimiter)
+  const RULES_START = "<!-- augment-cc:rules:start -->";
+  const RULES_END = "<!-- augment-cc:rules:end -->";
+  const STATIC_RULES_CONTENT = [
+    "## augment-cc Tool Rules",
+    "- **Use `cache_read`** for all information-gathering file reads. Deduplicates re-reads — unchanged files return a ~15-token stub instead of re-injecting full content.",
+    "- **Before Edit or Write:** use native Read with `offset` + `limit` scoped to just the lines you are changing. Do not use native Read for information gathering.",
+    "- **Use `shell_cached`** for all read-only shell commands (git log, git status, find, ls).",
+    "- **Use `run_saved_command(name)`** for any project script you have previously saved. Check the Script Library section of the project index at session start.",
+    "- **After compaction:** if `cache_read` returns a stub for content you no longer have, call with `force: true` to recover it. If you lose project schema/routes/types, read the `project://index` MCP resource.",
+  ].join("\n");
+  const STATIC_RULES_BLOCK = `${RULES_START}\n${STATIC_RULES_CONTENT}\n${RULES_END}`;
+
+  let claudeMdForRules = "";
+  try { claudeMdForRules = readFileSync(claudeMdPath, "utf-8"); } catch { /* may not exist yet */ }
+
+  if (claudeMdForRules.includes(RULES_START)) {
+    const startIdx = claudeMdForRules.indexOf(RULES_START);
+    const endIdx = claudeMdForRules.indexOf(RULES_END);
+    if (endIdx !== -1) {
+      const before = claudeMdForRules.slice(0, startIdx);
+      const after = claudeMdForRules.slice(endIdx + RULES_END.length);
+      writeFileSync(claudeMdPath, before + STATIC_RULES_BLOCK + after);
+      results.push("  [done] CLAUDE.md static tool rules updated");
+    } else {
+      results.push("  [skip] CLAUDE.md static rules block has no end marker — manual fix needed");
+    }
+  } else {
+    const existing = claudeMdForRules.trimEnd();
+    writeFileSync(claudeMdPath, existing + (existing ? "\n\n" : "") + STATIC_RULES_BLOCK + "\n");
+    results.push("  [done] CLAUDE.md static tool rules added");
+  }
+
+  // 4. .claude/settings.local.json — remove legacy PreToolUse hook (superseded by static CLAUDE.md)
   const localSettingsDir = join(root, ".claude");
   const localSettingsPath = join(localSettingsDir, "settings.local.json");
   let localSettings: Record<string, unknown> = {};
@@ -491,26 +506,25 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
   } catch { /* will create */ }
 
   const localHooks = (localSettings.hooks ?? (localSettings.hooks = {})) as Record<string, unknown>;
-  if (!Array.isArray(localHooks.PreToolUse)) localHooks.PreToolUse = [];
-  const preToolUseHooks = localHooks.PreToolUse as unknown[];
 
-  const alreadyHasReadHook = preToolUseHooks.some((entry: unknown) => {
-    const e = entry as Record<string, unknown>;
-    return (e.matcher as string | undefined) === "Read" &&
-      (e.hooks as Array<Record<string, unknown>> | undefined)?.some(h => {
+  if (Array.isArray(localHooks.PreToolUse)) {
+    const before = (localHooks.PreToolUse as unknown[]).length;
+    localHooks.PreToolUse = (localHooks.PreToolUse as unknown[]).filter((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      if ((e.matcher as string | undefined) !== "Read") return true;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return !inner?.some(h => {
         const cmd = h.command as string | undefined;
         return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
       });
-  });
-
-  if (alreadyHasReadHook) {
-    results.push("  [skip] PreToolUse hook already configured");
-  } else {
-    preToolUseHooks.push({
-      matcher: "Read",
-      hooks: [{ type: "command", command: `node ${binPath} redirect-read` }],
     });
-    results.push("  [done] PreToolUse hook added to .claude/settings.local.json (Read → non-blocking cache_read reminder)");
+    if ((localHooks.PreToolUse as unknown[]).length < before) {
+      results.push("  [done] Removed legacy PreToolUse Read hook from .claude/settings.local.json");
+    } else {
+      results.push("  [skip] No legacy PreToolUse hook found");
+    }
+  } else {
+    results.push("  [skip] No PreToolUse hooks configured");
   }
 
   // 5. .claude/settings.local.json MCP tool permissions (auto-approve cache_read + shell_cached)
@@ -644,25 +658,44 @@ async function runDeactivate(root: string): Promise<void> {
     results.push("  [skip] .mcp.json not found");
   }
 
-  // 2. CLAUDE.md — remove inject line
+  // 2. CLAUDE.md — remove inject line and static rules block
   const claudeMdPath = join(root, "CLAUDE.md");
   try {
     const content = readFileSync(claudeMdPath, "utf-8");
-    if (content.includes("augment-cc inject") || content.includes("dist/index.js inject")) {
-      const filtered = content
+    let filtered = content;
+    let claudeChanged = false;
+
+    if (filtered.includes("augment-cc inject") || filtered.includes("dist/index.js inject")) {
+      filtered = filtered
         .split("\n")
         .filter(l => !l.includes("augment-cc inject") && !l.includes("dist/index.js inject"))
         .join("\n")
-        .replace(/^\n+/, ""); // trim leading blank lines left by removal
-      if (filtered.trim() === "") {
-        unlinkSync(claudeMdPath);
-        results.push("  [done] Deleted CLAUDE.md (was only the inject line)");
-      } else {
-        writeFileSync(claudeMdPath, filtered);
-        results.push("  [done] Removed inject line from CLAUDE.md");
-      }
+        .replace(/^\n+/, "");
+      claudeChanged = true;
+      results.push("  [done] Removed inject line from CLAUDE.md");
     } else {
       results.push("  [skip] augment-cc inject line not found in CLAUDE.md");
+    }
+
+    if (filtered.includes("<!-- augment-cc:rules:start -->")) {
+      const startIdx = filtered.indexOf("<!-- augment-cc:rules:start -->");
+      const endIdx = filtered.indexOf("<!-- augment-cc:rules:end -->");
+      if (endIdx !== -1) {
+        filtered = (filtered.slice(0, startIdx) + filtered.slice(endIdx + "<!-- augment-cc:rules:end -->".length))
+          .replace(/\n{3,}/g, "\n\n")
+          .trimStart();
+        claudeChanged = true;
+        results.push("  [done] Removed static tool rules from CLAUDE.md");
+      }
+    }
+
+    if (claudeChanged) {
+      if (filtered.trim() === "") {
+        unlinkSync(claudeMdPath);
+        results.push("  [done] Deleted CLAUDE.md (now empty)");
+      } else {
+        writeFileSync(claudeMdPath, filtered);
+      }
     }
   } catch {
     results.push("  [skip] CLAUDE.md not found");
@@ -789,10 +822,10 @@ function runStatus(root: string): void {
   // Hooks
   lines.push("Hooks");
   const tick = (ok: boolean) => ok ? "✓" : "✗";
-  lines.push(`  MCP server (.mcp.json):         ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  Inject hook (CLAUDE.md):        ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  Stop hook (settings.json):      ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  PreToolUse hook (settings.local):${tick(hookConfig.hasPreToolUseHook)} ${hookConfig.hasPreToolUseHook ? "Read reminder active (non-blocking, allows native Read for Edit/Write)" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP server (.mcp.json):          ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Inject hook (CLAUDE.md):         ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Static tool rules (CLAUDE.md):   ${tick(hookConfig.hasStaticRules)} ${hookConfig.hasStaticRules ? "tool rules section present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Stop hook (settings.json):       ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  PostCompact hook (settings.local):${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "re-inject active (fires after every compaction)" : "not found — run augment-cc upgrade"}`);
   lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
