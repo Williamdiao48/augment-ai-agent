@@ -2,7 +2,7 @@ import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, recordRead, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
 import { buildCompactInject } from "./indexer/compact-inject.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
@@ -374,6 +374,7 @@ interface HookConfig {
   hasStopHook: boolean;
   hasPostCompactHook: boolean;
   hasPermissions: boolean;
+  hasReadTrackingHook: boolean;
 }
 
 function checkHookConfig(root: string): HookConfig {
@@ -413,6 +414,7 @@ function checkHookConfig(root: string): HookConfig {
   let hasSessionStartHook = false;
   let hasPostCompactHook = false;
   let hasPermissions = false;
+  let hasReadTrackingHook = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
     const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
@@ -439,10 +441,20 @@ function checkHookConfig(root: string): HookConfig {
 
     const localPerms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     const allowed = (Array.isArray(localPerms.allow) ? localPerms.allow : []) as string[];
-    hasPermissions = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
+    hasPermissions = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
+
+    const preToolUse = (Array.isArray(localHooks.PreToolUse) ? localHooks.PreToolUse : []) as unknown[];
+    hasReadTrackingHook = preToolUse.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && cmd.includes("track-read");
+      });
+    });
   } catch { /* missing */ }
 
-  return { hasMcp, hasSessionStartHook, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions };
+  return { hasMcp, hasSessionStartHook, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions, hasReadTrackingHook };
 }
 
 // ── init / upgrade shared config writer ───────────────────────────────────
@@ -521,11 +533,7 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
   const RULES_END = "<!-- augment-cc:rules:end -->";
   const STATIC_RULES_CONTENT = [
     "## augment-cc Tool Rules",
-    "- **Use `cache_read`** for all information-gathering file reads. Deduplicates re-reads — unchanged files return a ~15-token stub instead of re-injecting full content.",
-    "- **Before Edit or Write:** use native Read with `offset` + `limit` scoped to just the lines you are changing. Do not use native Read for information gathering.",
-    "- **Use `shell_cached`** for all read-only shell commands (git log, git status, find, ls).",
-    "- **Use `run_saved_command(name)`** for any project script you have previously saved. Check the Script Library section of the project index at session start.",
-    "- **After compaction:** if `cache_read` returns a stub for content you no longer have, call with `force: true` to recover it. If you lose project schema/routes/types, read the `project://index` MCP resource.",
+    "- Use **`search_file(path, keyword)`** to locate a function or symbol — returns the relevant section with line numbers. Use those line numbers for a targeted native Read before Edit.",
   ].join("\n");
   const STATIC_RULES_BLOCK = `${RULES_START}\n${STATIC_RULES_CONTENT}\n${RULES_END}`;
 
@@ -579,7 +587,30 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [skip] No PreToolUse hooks configured");
   }
 
-  // 4b. SessionStart hooks (startup + resume) — inject on new session and resume
+  // 4b. Silent Read tracking hook — records file paths to session_reads for compact-inject
+  if (!Array.isArray(localHooks.PreToolUse)) localHooks.PreToolUse = [];
+  const preToolUseHooks = localHooks.PreToolUse as unknown[];
+
+  const alreadyHasTracking = preToolUseHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+    return inner?.some(h => {
+      const cmd = h.command as string | undefined;
+      return typeof cmd === "string" && cmd.includes("track-read");
+    });
+  });
+
+  if (alreadyHasTracking) {
+    results.push("  [skip] Read tracking hook already configured");
+  } else {
+    preToolUseHooks.push({
+      matcher: "Read",
+      hooks: [{ type: "command", command: `node ${binPath} track-read --project-root ${root}` }],
+    });
+    results.push("  [done] Silent Read tracking hook added to .claude/settings.local.json");
+  }
+
+  // 4c. SessionStart hooks (startup + resume) — inject on new session and resume
   if (!Array.isArray(localHooks.SessionStart)) localHooks.SessionStart = [];
   const sessionStartHooks = localHooks.SessionStart as unknown[];
 
@@ -606,16 +637,19 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [done] SessionStart hooks added (startup + resume) to .claude/settings.local.json");
   }
 
-  // 5. .claude/settings.local.json MCP tool permissions (auto-approve cache_read + shell_cached)
-  const MCP_TOOLS = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"];
+  // 5. .claude/settings.local.json MCP tool permissions (auto-approve search_file + shell_cached)
+  const MCP_TOOLS = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached"];
   const perms = (localSettings.permissions ?? (localSettings.permissions = {})) as Record<string, unknown>;
   const allowed = (Array.isArray(perms.allow) ? perms.allow : (perms.allow = [])) as string[];
+  // Migrate legacy cache_read permission entry
+  const legacyIdx = (allowed as string[]).indexOf("mcp__augment-cc__cache_read");
+  if (legacyIdx !== -1) { (allowed as string[]).splice(legacyIdx, 1, "mcp__augment-cc__search_file"); }
   const newTools = MCP_TOOLS.filter(t => !allowed.includes(t));
   if (newTools.length === 0) {
     results.push("  [skip] MCP tool permissions already configured");
   } else {
     allowed.push(...newTools);
-    results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve cache_read, shell_cached)");
+    results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve search_file, shell_cached)");
   }
 
   // 6. .claude/settings.local.json PostCompact hook (re-inject context after compaction)
@@ -733,23 +767,33 @@ async function runPostCompact(): Promise<void> {
   await runInject(root);
 }
 
+// ── track-read ─────────────────────────────────────────────────────────────
+
+async function runTrackRead(root: string): Promise<void> {
+  // Silent PreToolUse hook — records native Read file paths to session_reads for compact-inject.
+  // No stdout output. Exit 0 always so the Read proceeds normally.
+  try {
+    let raw = "";
+    for await (const chunk of process.stdin) {
+      raw += chunk as string;
+      if (raw.length > 4 * 1024) break;
+    }
+    const payload = JSON.parse(raw) as { session_id?: string; tool_input?: { file_path?: string } };
+    const filePath = payload.tool_input?.file_path;
+    const sessionId = payload.session_id ?? "tracked";
+    if (!filePath || !filePath.startsWith(root)) return;
+    initIndexDb();
+    recordRead(sessionId, filePath, "tracked");
+  } catch { /* never block the Read */ }
+}
+
 // ── compact-inject ─────────────────────────────────────────────────────────
 
 async function runCompactInject(root: string): Promise<void> {
   initIndexDb();
   recordCompaction(root);
-
-  process.stdout.write("[augment-cc: compaction detected — re-injecting targeted context]\n\n");
-
-  const targeted = await buildCompactInject(root);
-
-  if (!targeted) {
-    // No session_reads data (Claude not using cache_read) — fall back to full inject
-    process.stderr.write("augment-cc: no session activity data, falling back to full inject\n");
-    return runInject(root);
-  }
-
-  process.stdout.write(targeted + "\n");
+  const output = await buildCompactInject(root);
+  process.stdout.write(output + "\n");
 }
 
 // ── deactivate ─────────────────────────────────────────────────────────────
@@ -885,7 +929,7 @@ async function runDeactivate(root: string): Promise<void> {
     }
 
     // Remove MCP permissions
-    const MCP_TOOLS = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"];
+    const MCP_TOOLS = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached", "mcp__augment-cc__cache_read"];
     const perms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     if (Array.isArray(perms.allow)) {
       const before = perms.allow.length;
@@ -961,10 +1005,11 @@ function runStatus(root: string): void {
   const tick = (ok: boolean) => ok ? "✓" : "✗";
   lines.push(`  MCP server (.mcp.json):            ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
   lines.push(`  SessionStart hook (settings.local): ${tick(hookConfig.hasSessionStartHook)} ${hookConfig.hasSessionStartHook ? "inject on startup + resume" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Read tracking hook (settings.local):${tick(hookConfig.hasReadTrackingHook)} ${hookConfig.hasReadTrackingHook ? "silent native Read tracking active" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Static tool rules (CLAUDE.md):     ${tick(hookConfig.hasStaticRules)} ${hookConfig.hasStaticRules ? "tool rules section present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Stop hook (settings.json):         ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  PostCompact hook (settings.local):  ${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "compact-inject active (targeted re-inject after compaction)" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  MCP permissions (settings.local):   ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP permissions (settings.local):   ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "search_file + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -979,6 +1024,7 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "deactivate") return runDeactivate(root);
   if (command === "post-compact") return runPostCompact();
   if (command === "compact-inject") return runCompactInject(root);
+  if (command === "track-read") return runTrackRead(root);
   if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);

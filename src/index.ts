@@ -2,10 +2,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { cache_read } from "./tools/cache_read.js";
+import { cache_read } from "./tools/search_file.js";
 import { shell_cached } from "./tools/shell_cached.js";
 import { run_saved_command } from "./tools/run_saved_command.js";
-import { stats } from "./cache.js";
+import { stats as _stats } from "./cache.js";
 import { IndexerService, getProjectIndex } from "./indexer/index.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { initIndexDb, pruneOldSessionReads, pruneOldCommandRuns, saveCommand } from "./indexer/db.js";
@@ -18,8 +18,8 @@ const server = new McpServer({
 });
 
 server.tool(
-  "cache_read",
-  "Read a file with content-hash caching. Returns cached result if file hasn't changed, avoiding redundant reads that bloat context.",
+  "search_file",
+  "Search a file by keyword — returns the matching section with line numbers. Use for locating functions or symbols before editing.",
   {
     path: z.string().describe("Absolute or relative path to the file"),
     max_lines: z.number().optional().describe("Truncate to this many lines (default: 500). Ignored when keyword is set."),
@@ -106,23 +106,6 @@ server.resource(
       || "<!-- Project index not yet built — retry in a moment -->";
     return {
       contents: [{ uri: "project://index", mimeType: "text/markdown", text }],
-    };
-  }
-);
-
-server.tool(
-  "cache_stats",
-  "Report cache hit statistics and entry counts.",
-  {},
-  async () => {
-    const s = stats();
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Cache entries: ${s.total} total, ${s.expired} expired (pending cleanup)`,
-        },
-      ],
     };
   }
 );
