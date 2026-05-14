@@ -1,5 +1,5 @@
 import { basename, relative } from "path";
-import type { ProjectIndex } from "./types.js";
+import type { ProjectIndex, TsFunctionRef } from "./types.js";
 
 const MAX_MODELS = Number(process.env.AUGMENT_CC_MAX_MODELS ?? 20);
 const MAX_FIELDS = 6;
@@ -162,6 +162,26 @@ export function formatIndex(index: ProjectIndex): string {
       const { shown: members, rest: mr } = truncateList(t.members, MAX_TYPE_MEMBERS);
       const memberStr = members.map((m) => `${m.name}: ${m.type}`).join(", ");
       sections.push(`- ${t.kind} ${t.name} { ${memberStr}${mr > 0 ? `, +${mr} more` : ""} }`);
+    }
+  }
+
+  // --- TypeScript Functions ---
+  if (types.tsFunctions && types.tsFunctions.length > 0) {
+    const MAX_FUNCTION_FILES_SHOWN = 5;
+    const MAX_FUNCTIONS_SHOWN = 6;
+    const byFile = new Map<string, TsFunctionRef[]>();
+    for (const fn of types.tsFunctions) {
+      if (!byFile.has(fn.sourceFile)) byFile.set(fn.sourceFile, []);
+      byFile.get(fn.sourceFile)!.push(fn);
+    }
+    const sortedFiles = [...byFile.entries()].sort((a, b) => b[1].length - a[1].length);
+    const { shown: shownFiles, rest: restFiles } = truncateList(sortedFiles, MAX_FUNCTION_FILES_SHOWN);
+    sections.push("", `## TypeScript Functions (${types.tsFunctions.length} exported across ${byFile.size} files${more(restFiles)})`);
+    for (const [filePath, fns] of shownFiles) {
+      const rel = relative(index.projectRoot, filePath) || basename(filePath);
+      const { shown: shownFns, rest: restFns } = truncateList(fns, MAX_FUNCTIONS_SHOWN);
+      const fnStr = shownFns.map(f => `${f.name} [${f.startLine}-${f.endLine}]`).join(" | ");
+      sections.push(`- ${rel}: ${fnStr}${restFns > 0 ? ` [+${restFns} more]` : ""}`);
     }
   }
 

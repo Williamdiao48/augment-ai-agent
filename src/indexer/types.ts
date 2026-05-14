@@ -101,6 +101,16 @@ export interface TsInterface {
   sourceFile: string;
 }
 
+export interface TsFunctionRef {
+  name: string;
+  startLine: number;
+  endLine: number;
+  params: string[];
+  returnType?: string;
+  isExported: boolean;
+  sourceFile: string;
+}
+
 export interface GraphqlField {
   name: string;
   type: string;
@@ -167,6 +177,7 @@ export interface RouteList {
 export interface TypeSchema {
   tsInterfaces: TsInterface[];
   graphqlTypes: GraphqlType[];
+  tsFunctions: TsFunctionRef[];
 }
 
 export interface ProjectIndex {

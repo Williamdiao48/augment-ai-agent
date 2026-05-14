@@ -1,6 +1,7 @@
-import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getRecentSessions } from "./db.js";
+import { relative, basename } from "path";
+import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getRecentSessions, getTopReadFiles } from "./db.js";
 import { getGitState, formatGitState } from "./git.js";
-import type { ProjectIndex } from "./types.js";
+import type { ProjectIndex, TsFunctionRef } from "./types.js";
 
 export async function buildCompactInject(root: string): Promise<string> {
   initIndexDb();
@@ -138,7 +139,26 @@ export async function buildCompactInject(root: string): Promise<string> {
     }
   }
 
-  // TIER 4 — Symbol maps for top-5 hot files (Phase 27)
+  // TIER 4 — Symbol maps for top-5 hot files
+  if (index) {
+    const tsFunctions: TsFunctionRef[] = (index.types as ProjectIndex["types"] & { tsFunctions?: TsFunctionRef[] }).tsFunctions ?? [];
+    if (tsFunctions.length > 0) {
+      const hotFiles = getTopReadFiles(root, 5);
+      const hotWithFns = hotFiles
+        .map(hf => ({ ...hf, fns: tsFunctions.filter(f => f.sourceFile === hf.file_path) }))
+        .filter(hf => hf.fns.length > 0);
+
+      if (hotWithFns.length > 0) {
+        sections.push("", `## Hot File Symbol Maps (${hotWithFns.length} file(s))`);
+        for (const hf of hotWithFns) {
+          const rel = relative(root, hf.file_path) || basename(hf.file_path);
+          const fnList = hf.fns.slice(0, 8).map(f => `${f.name} [${f.startLine}-${f.endLine}]`).join(" | ");
+          const extra = hf.fns.length > 8 ? ` [+${hf.fns.length - 8} more]` : "";
+          sections.push(`- ${rel} (${hf.session_count} sessions): ${fnList}${extra}`);
+        }
+      }
+    }
+  }
 
   return sections.join("\n");
 }

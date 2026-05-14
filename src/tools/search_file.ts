@@ -2,7 +2,8 @@ import { readFileSync, statSync } from "fs";
 import { resolve, basename } from "path";
 import { createPatch } from "diff";
 import { hashContent, get, set } from "../cache.js";
-import { hasBeenRead, recordRead, refreshSessionHash, resetSessionReadBaseline, getLastCompaction } from "../indexer/db.js";
+import { hasBeenRead, recordRead, refreshSessionHash, resetSessionReadBaseline, getLastCompaction, getStoredIndex } from "../indexer/db.js";
+import type { ProjectIndex, TsFunctionRef } from "../indexer/types.js";
 
 // ── Diff helper ───────────────────────────────────────────────────────────
 
@@ -36,7 +37,14 @@ function mergeWindows(windows: number[][]): number[][] {
   return merged;
 }
 
-function keywordExcerpt(raw: string, file: string, keyword: string, contextLines: number): string {
+function keywordExcerpt(
+  raw: string,
+  absPath: string,
+  file: string,
+  keyword: string,
+  contextLines: number,
+  projectRoot?: string,
+): string {
   const lines = raw.split("\n");
   const re = new RegExp(keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
   const matchIndices = lines.map((l, i) => re.test(l) ? i : -1).filter(i => i !== -1);
@@ -47,10 +55,30 @@ function keywordExcerpt(raw: string, file: string, keyword: string, contextLines
     return `[augment-cc: no matches for "${keyword}" in ${file} — showing first 50 lines]\n\n${head}${suffix}`;
   }
 
-  const windows = matchIndices.map(i => [
-    Math.max(0, i - contextLines),
-    Math.min(lines.length - 1, i + contextLines),
-  ]);
+  // Function-boundary expansion: look up containing function from stored index
+  let funcBoundaries: Map<number, TsFunctionRef> | null = null;
+  if (projectRoot && (absPath.endsWith(".ts") || absPath.endsWith(".tsx"))) {
+    try {
+      const stored = getStoredIndex(projectRoot);
+      if (stored) {
+        const idx = JSON.parse(stored.index_json) as ProjectIndex;
+        const fns = idx.types.tsFunctions?.filter(f => f.sourceFile === absPath) ?? [];
+        if (fns.length > 0) {
+          funcBoundaries = new Map();
+          for (const mi of matchIndices) {
+            const fn = fns.find(f => f.startLine - 1 <= mi && mi <= f.endLine - 1);
+            if (fn) funcBoundaries.set(mi, fn);
+          }
+        }
+      }
+    } catch { /* best-effort — fall through to contextLines */ }
+  }
+
+  const windows = matchIndices.map(i => {
+    const fb = funcBoundaries?.get(i);
+    if (fb) return [fb.startLine - 1, fb.endLine - 1];
+    return [Math.max(0, i - contextLines), Math.min(lines.length - 1, i + contextLines)];
+  });
   const merged = mergeWindows(windows);
 
   const DENSE_THRESHOLD = 0.20;
@@ -74,7 +102,8 @@ function keywordExcerpt(raw: string, file: string, keyword: string, contextLines
     shown = merged.slice(0, MAX_REGIONS);
     const omitted = merged.length - shown.length;
     const omittedNote = omitted > 0 ? ` — ${omitted} region(s) omitted` : "";
-    header = `[augment-cc: ${shown.length} match region(s) for "${keyword}" in ${file} (${matchIndices.length} match line(s))${omittedNote}]`;
+    const boundaryNote = funcBoundaries && funcBoundaries.size > 0 ? " (function boundaries applied)" : "";
+    header = `[augment-cc: ${shown.length} match region(s) for "${keyword}" in ${file} (${matchIndices.length} match line(s))${omittedNote}${boundaryNote}]`;
   }
 
   const sections = shown.map(([start, end]) =>
@@ -291,7 +320,8 @@ export async function cache_read(args: {
 
   // Keyword excerpt mode: return targeted search results, skip full-read cache and dedup recording
   if (args.keyword) {
-    return keywordExcerpt(raw, basename(absPath), args.keyword, args.context_lines ?? 10);
+    const projectRoot = args.project_root ? resolve(args.project_root) : undefined;
+    return keywordExcerpt(raw, absPath, basename(absPath), args.keyword, args.context_lines ?? 10, projectRoot);
   }
 
   const currentHash = hashContent(raw);

@@ -14,7 +14,7 @@ import { extractExpress } from "./extractors/express.js";
 import { extractNextjs } from "./extractors/nextjs.js";
 import { extractFastapi } from "./extractors/fastapi.js";
 import { extractRails } from "./extractors/rails.js";
-import { extractTypescript, isHighValueTypeFile } from "./extractors/typescript.js";
+import { extractTypescript, extractTsFunctions, isHighValueTypeFile } from "./extractors/typescript.js";
 import { extractGraphql } from "./extractors/graphql.js";
 import { extractEnv } from "./extractors/env.js";
 import { extractDocker } from "./extractors/docker.js";
@@ -28,7 +28,7 @@ function emptyIndex(root: string): ProjectIndex {
     detectedTypes: [],
     db: { prismaModels: [], prismaEnums: [], sqlTables: [], djangoModels: [], typeormModels: [] },
     routes: { express: [], nextjs: [], fastapi: [], rails: [] },
-    types: { tsInterfaces: [], graphqlTypes: [] },
+    types: { tsInterfaces: [], graphqlTypes: [], tsFunctions: [] },
     env: [],
     docker: [],
     fileTree: { totalFiles: 0, byExtension: {}, topDirs: [] },
@@ -84,6 +84,7 @@ export class IndexerService {
     const types: TypeSchema = index.types;
 
     const tsTypeFiles: string[] = [];
+    const tsFunctionFiles: string[] = [];
 
     for (const filePath of allFiles) {
       const content = await safeRead(filePath);
@@ -180,6 +181,11 @@ export class IndexerService {
         tsTypeFiles.push(filePath);
       }
 
+      // TypeScript function refs — all TS files
+      if (detectedTypes.has("typescript") && (ext === ".ts" || ext === ".tsx")) {
+        tsFunctionFiles.push(filePath);
+      }
+
       // Python class/function extraction (all .py files)
       if (detectedTypes.has("python") && ext === ".py") {
         try {
@@ -197,11 +203,18 @@ export class IndexerService {
       } catch (e) { process.stderr.write(`augment-cc [nextjs] ${e}\n`); }
     }
 
-    // TypeScript interfaces — batched AST pass
+    // TypeScript interfaces — batched AST pass (high-value type files only)
     if (tsTypeFiles.length > 0) {
       try {
         types.tsInterfaces.push(...(await extractTypescript(tsTypeFiles)));
       } catch (e) { process.stderr.write(`augment-cc [typescript] ${e}\n`); }
+    }
+
+    // TypeScript function refs — all TS files
+    if (tsFunctionFiles.length > 0) {
+      try {
+        types.tsFunctions.push(...(await extractTsFunctions(tsFunctionFiles)));
+      } catch (e) { process.stderr.write(`augment-cc [ts-functions] ${e}\n`); }
     }
 
     index.builtAt = Date.now();
