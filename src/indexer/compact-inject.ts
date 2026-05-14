@@ -1,57 +1,15 @@
 import { relative, basename } from "path";
-import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getRecentSessions, getTopReadFiles, getAllSavedCommands } from "./db.js";
-import { getGitState, formatGitState } from "./git.js";
+import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getTopReadFiles } from "./db.js";
 import type { ProjectIndex, TsFunctionRef } from "./types.js";
 
 export async function buildCompactInject(root: string): Promise<string> {
   initIndexDb();
-  const sections: string[] = ["[augment-cc: compaction detected — re-injecting context]", ""];
+  const sections: string[] = ["[augment-cc: compaction detected]", ""];
 
-  // TIER 1 — Non-reconstructable context (always inject)
-
-  // Git state
-  sections.push(formatGitState(getGitState(root)));
-
-  // Last 2 session summaries
-  const sessions = getRecentSessions(root, 2);
-  if (sessions.length > 0) {
-    sections.push("", "## Recent Sessions");
-    for (const s of sessions) {
-      const date = new Date(s.startedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      const title = s.aiTitle ?? s.summary.slice(0, 60);
-      sections.push(`- ${date} (\`${s.branch}\`): ${title}`);
-      if (s.closingNotes.length > 0) {
-        const note = s.closingNotes[s.closingNotes.length - 1].slice(0, 120);
-        sections.push(`  Concluded: "${note}"`);
-      }
-    }
-  }
-
-  // TIER 2 — Project structure (always inject, compact)
   const stored = getStoredIndex(root);
   let index: ProjectIndex | null = null;
-
   if (stored) {
     index = JSON.parse(stored.index_json) as ProjectIndex;
-    const tree = index.fileTree;
-    const frameworks = index.detectedTypes.length > 0 ? index.detectedTypes.join(", ") : "no recognized framework";
-    sections.push("", `## Project (${tree.totalFiles} files — ${frameworks})`);
-    const topDirs = tree.topDirs.slice(0, 4).join("  ");
-    if (topDirs) sections.push(topDirs);
-  }
-
-  // Script Library — recover saved commands after compaction
-  const saved = getAllSavedCommands(root);
-  if (saved.length > 0) {
-    sections.push("", "## Script Library");
-    const MAX_SHOWN = 8;
-    for (const s of saved.slice(0, MAX_SHOWN)) {
-      const failNote = s.last_failed_at
-        ? ` [last failed: ${Math.round((Date.now() - s.last_failed_at) / 3_600_000)}h ago]`
-        : "";
-      sections.push(`- \`${s.name}\` — ${s.description || s.script.slice(0, 50)}${failNote}`);
-    }
-    if (saved.length > MAX_SHOWN) sections.push(`- [+${saved.length - MAX_SHOWN} more — use list_commands()]`);
   }
 
   // TIER 3 — Active schemas from session_reads
