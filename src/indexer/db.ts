@@ -103,6 +103,9 @@ export function initIndexDb(): void {
       PRIMARY KEY (project_root, name)
     );
   `);
+  try {
+    getDb().prepare("ALTER TABLE saved_commands ADD COLUMN last_failed_at INTEGER").run();
+  } catch { /* column already exists */ }
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -376,10 +379,10 @@ export function getCommand(projectRoot: string, name: string): { script: string;
     .get(projectRoot, name) as Row | undefined) ?? null;
 }
 
-export function getAllSavedCommands(projectRoot: string): Array<{ name: string; script: string; description: string; run_count: number }> {
-  type Row = { name: string; script: string; description: string; run_count: number };
+export function getAllSavedCommands(projectRoot: string): Array<{ name: string; script: string; description: string; run_count: number; last_failed_at: number | null }> {
+  type Row = { name: string; script: string; description: string; run_count: number; last_failed_at: number | null };
   return getDb()
-    .prepare("SELECT name, script, description, run_count FROM saved_commands WHERE project_root = ? ORDER BY run_count DESC, name ASC")
+    .prepare("SELECT name, script, description, run_count, last_failed_at FROM saved_commands WHERE project_root = ? ORDER BY run_count DESC, name ASC")
     .all(projectRoot) as Row[];
 }
 
@@ -387,6 +390,19 @@ export function incrementSavedCommandRun(projectRoot: string, name: string): voi
   getDb()
     .prepare("UPDATE saved_commands SET run_count = run_count + 1 WHERE project_root = ? AND name = ?")
     .run(projectRoot, name);
+}
+
+export function deleteCommand(projectRoot: string, name: string): boolean {
+  const result = getDb()
+    .prepare("DELETE FROM saved_commands WHERE project_root = ? AND name = ?")
+    .run(projectRoot, name);
+  return result.changes > 0;
+}
+
+export function updateLastFailed(projectRoot: string, name: string): void {
+  getDb()
+    .prepare("UPDATE saved_commands SET last_failed_at = ? WHERE project_root = ? AND name = ?")
+    .run(Date.now(), projectRoot, name);
 }
 
 export function pruneOldCommandRuns(maxAgeMs: number = 30 * 24 * 3600 * 1000): void {

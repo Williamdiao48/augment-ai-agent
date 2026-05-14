@@ -1,5 +1,5 @@
 import { relative, basename } from "path";
-import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getRecentSessions, getTopReadFiles } from "./db.js";
+import { initIndexDb, getStoredIndex, getLastCompaction, getReadsSinceCompaction, getRecentSessions, getTopReadFiles, getAllSavedCommands } from "./db.js";
 import { getGitState, formatGitState } from "./git.js";
 import type { ProjectIndex, TsFunctionRef } from "./types.js";
 
@@ -38,6 +38,20 @@ export async function buildCompactInject(root: string): Promise<string> {
     sections.push("", `## Project (${tree.totalFiles} files — ${frameworks})`);
     const topDirs = tree.topDirs.slice(0, 4).join("  ");
     if (topDirs) sections.push(topDirs);
+  }
+
+  // Script Library — recover saved commands after compaction
+  const saved = getAllSavedCommands(root);
+  if (saved.length > 0) {
+    sections.push("", "## Script Library");
+    const MAX_SHOWN = 8;
+    for (const s of saved.slice(0, MAX_SHOWN)) {
+      const failNote = s.last_failed_at
+        ? ` [last failed: ${Math.round((Date.now() - s.last_failed_at) / 3_600_000)}h ago]`
+        : "";
+      sections.push(`- \`${s.name}\` — ${s.description || s.script.slice(0, 50)}${failNote}`);
+    }
+    if (saved.length > MAX_SHOWN) sections.push(`- [+${saved.length - MAX_SHOWN} more — use list_commands()]`);
   }
 
   // TIER 3 — Active schemas from session_reads

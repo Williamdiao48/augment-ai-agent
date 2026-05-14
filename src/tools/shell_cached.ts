@@ -4,7 +4,7 @@ import { recordCommandRun } from "../indexer/db.js";
 
 // ── Output filters ─────────────────────────────────────────────────────────
 
-function stripAnsi(s: string): string {
+export function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*[mGKHF]/g, "");
 }
 
@@ -31,7 +31,7 @@ function stripGitPatchHunks(output: string): string {
   }).join("");
 }
 
-function stripPackageManagerNoise(output: string): string {
+function _stripPmNoise(output: string): string {
   const NOISE_RE = /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|^(added|removed|changed|audited|found) \d+|^npm warn deprecated|^npm (WARN )?progress/i;
   const KEEP_RE = /error|ERR!|warn(?!.*deprecated)|vulnerabilit/i;
   const filtered = output
@@ -41,10 +41,16 @@ function stripPackageManagerNoise(output: string): string {
   return filtered.trim() ? filtered : output;
 }
 
+// Exported for reuse: strips package manager noise when command is a pm install
+export function stripPackageManagerNoise(command: string, output: string): string {
+  if (!/\b(npm|yarn|pnpm)\s+(install|ci|add)\b/.test(command)) return output;
+  return _stripPmNoise(output);
+}
+
 type FilterFn = (output: string) => string;
 const COMMAND_FILTERS: Array<{ pattern: RegExp; filter: FilterFn }> = [
   { pattern: /git\s+log\s+.*(--patch|-p)\b/, filter: stripGitPatchHunks },
-  { pattern: /\b(npm|yarn|pnpm)\s+(install|ci|add)\b/, filter: stripPackageManagerNoise },
+  { pattern: /\b(npm|yarn|pnpm)\s+(install|ci|add)\b/, filter: _stripPmNoise },
 ];
 
 function applyCommandFilter(command: string, output: string): string {

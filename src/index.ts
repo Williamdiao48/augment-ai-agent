@@ -3,12 +3,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { cache_read } from "./tools/search_file.js";
-import { shell_cached } from "./tools/shell_cached.js";
+import { bash_exec } from "./tools/bash_exec.js";
 import { run_saved_command } from "./tools/run_saved_command.js";
+import { list_commands } from "./tools/list_commands.js";
 import { stats as _stats } from "./cache.js";
 import { IndexerService, getProjectIndex } from "./indexer/index.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
-import { initIndexDb, pruneOldSessionReads, pruneOldCommandRuns, saveCommand } from "./indexer/db.js";
+import { initIndexDb, pruneOldSessionReads, pruneOldCommandRuns, deleteCommand } from "./indexer/db.js";
 
 const SESSION_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -48,38 +49,24 @@ server.tool(
 );
 
 server.tool(
-  "shell_cached",
-  "Run a read-only shell command with TTL-based caching. Returns cached output within TTL window. Use for git log/status, find, ls, npm list — never for commands with side effects.",
+  "bash",
+  "Run a shell command with output filtering (ANSI stripping, npm noise removal) and optional script saving. Pass save_as to upsert a named script for reuse. Pass filter: false for raw output.",
   {
     command: z.string().describe("Shell command to execute"),
-    cwd: z.string().optional().describe("Working directory (default: cwd)"),
-    ttl_ms: z.number().optional().describe("Cache TTL in ms (auto-detected by command pattern)"),
-    max_output_chars: z.number().optional().describe("Truncate output to N chars (default: 8000)"),
+    filter: z.boolean().optional().describe("Apply ANSI stripping and package manager noise filtering (default: true). Pass false for raw output."),
+    max_output: z.number().optional().describe("Truncate output to this many characters (default: 8000)"),
+    save_as: z.string().optional().describe("Save this command under a short name for reuse (upserts — overwrites if name exists). Use snake_case."),
+    description: z.string().optional().describe("One-line description for the saved script (used with save_as)"),
+    cwd: z.string().optional().describe("Working directory (default: process.cwd())"),
   },
   async (args) => ({
-    content: [{ type: "text", text: await shell_cached({ ...args, _projectRoot: process.cwd() }) }],
+    content: [{ type: "text", text: await bash_exec({ ...args, _projectRoot: process.cwd() }) }],
   })
 );
 
 server.tool(
-  "save_command",
-  "Save a bash script under a short name for quick reuse across sessions. Saved commands appear in the Script Library section of the project index at every session start and can be run instantly with run_saved_command.",
-  {
-    name: z.string().describe("Short identifier for this script (e.g. 'git_recent', 'run_tests'). Use snake_case."),
-    script: z.string().describe("The bash script or command to save"),
-    description: z.string().describe("One-line description of what this script does"),
-  },
-  async (args) => {
-    saveCommand(process.cwd(), args.name, args.script, args.description);
-    return {
-      content: [{ type: "text", text: `[augment-cc: saved command "${args.name}" — available immediately via run_saved_command("${args.name}") and will appear in the Script Library at next session start]` }],
-    };
-  }
-);
-
-server.tool(
   "run_saved_command",
-  "Run a previously saved project script by name. Scripts are listed in the Script Library section of the project index. Always returns live output (no TTL caching).",
+  "Run a previously saved project script by name. Use list_commands() to see available scripts. Always returns live output.",
   {
     name: z.string().describe("Name of the saved command to run"),
     cwd: z.string().optional().describe("Working directory (default: project root)"),
@@ -88,6 +75,30 @@ server.tool(
   async (args) => ({
     content: [{ type: "text", text: await run_saved_command({ ...args, _projectRoot: process.cwd() }) }],
   })
+);
+
+server.tool(
+  "list_commands",
+  "List all saved scripts and frequently-run commands for this project. Shows last_failed_at for scripts that have failed.",
+  {},
+  async () => ({
+    content: [{ type: "text", text: await list_commands({ _projectRoot: process.cwd() }) }],
+  })
+);
+
+server.tool(
+  "delete_command",
+  "Delete a saved script by name.",
+  {
+    name: z.string().describe("Name of the saved command to delete"),
+  },
+  async ({ name }) => {
+    const removed = deleteCommand(process.cwd(), name);
+    const msg = removed
+      ? `[augment-cc: deleted command "${name}"]`
+      : `[augment-cc: no saved command "${name}" found]`;
+    return { content: [{ type: "text", text: msg }] };
+  }
 );
 
 server.resource(

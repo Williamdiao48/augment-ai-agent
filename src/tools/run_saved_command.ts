@@ -1,5 +1,6 @@
 import { execSync } from "child_process";
-import { getCommand, getAllSavedCommands, incrementSavedCommandRun } from "../indexer/db.js";
+import { getCommand, getAllSavedCommands, incrementSavedCommandRun, updateLastFailed } from "../indexer/db.js";
+import { stripAnsi } from "./shell_cached.js";
 
 export async function run_saved_command(args: {
   name: string;
@@ -14,7 +15,7 @@ export async function run_saved_command(args: {
     const all = getAllSavedCommands(projectRoot);
     const available = all.length > 0
       ? `Available commands: ${all.map(c => `"${c.name}"`).join(", ")}`
-      : "No commands saved yet — use save_command(name, script, description) to create one.";
+      : "No commands saved yet — use bash(command, { save_as: 'name' }) to create one.";
     return `[augment-cc: no saved command "${args.name}". ${available}]`;
   }
 
@@ -22,6 +23,7 @@ export async function run_saved_command(args: {
   const maxChars = args.max_output_chars ?? 8_000;
 
   let output: string;
+  let failed = false;
   try {
     output = execSync(cmd.script, {
       cwd,
@@ -30,18 +32,23 @@ export async function run_saved_command(args: {
       timeout: 30_000,
     });
   } catch (e: unknown) {
+    failed = true;
     const err = e as { stdout?: string; stderr?: string; message?: string };
     output = err.stdout ?? err.stderr ?? err.message ?? String(e);
   }
 
-  output = output.replace(/\x1b\[[0-9;]*[mGKHF]/g, "");
+  output = stripAnsi(output);
 
   const truncated = output.length > maxChars;
   const result = truncated
     ? output.slice(0, maxChars) + `\n[truncated: ${output.length} chars total]`
     : output;
 
-  incrementSavedCommandRun(projectRoot, args.name);
+  if (failed) {
+    updateLastFailed(projectRoot, args.name);
+    return `[script "${args.name}" failed — command was: ${cmd.script}\n\n${result}\n\nUpdate with bash(command, { save_as: "${args.name}" }) or use delete_command("${args.name}") to remove it.]`;
+  }
 
+  incrementSavedCommandRun(projectRoot, args.name);
   return result;
 }

@@ -2,9 +2,9 @@ import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, recordRead, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, recordRead, recordCommandRun, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
 import { buildCompactInject } from "./indexer/compact-inject.js";
-import { stats } from "./cache.js";
+import { stats, hashContent } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
 import { parseTranscript } from "./indexer/transcript.js";
@@ -74,8 +74,15 @@ function formatHighValueFiles(files: Array<{ file_path: string; session_count: n
 
 // ── script library formatter ───────────────────────────────────────────────
 
+function formatAge(ts: number): string {
+  const ms = Date.now() - ts;
+  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
+  return `${Math.round(ms / 86_400_000)}d ago`;
+}
+
 function formatScriptLibrary(
-  saved: Array<{ name: string; description: string; run_count: number }>,
+  saved: Array<{ name: string; description: string; run_count: number; last_failed_at?: number | null }>,
   frequent: Array<{ command: string; run_count: number }>,
 ): string | null {
   if (saved.length === 0 && frequent.length === 0) return null;
@@ -85,10 +92,11 @@ function formatScriptLibrary(
   if (saved.length > 0) {
     lines.push("## Script Library", "");
     for (const s of saved) {
-      lines.push(`- \`${s.name}\` — ${s.description}`);
+      const failNote = s.last_failed_at ? ` [last failed: ${formatAge(s.last_failed_at)}]` : "";
+      lines.push(`- \`${s.name}\` — ${s.description}${failNote}`);
     }
     lines.push("");
-    lines.push("Run any of these with `run_saved_command(name)`.");
+    lines.push("Run any of these with `run_saved_command(name)`. Update a script with `bash(command, { save_as: 'name' })`.");
   }
 
   if (frequent.length > 0) {
@@ -98,7 +106,7 @@ function formatScriptLibrary(
       lines.push(`- \`${preview}\` (${f.run_count}×)`);
     }
     lines.push("");
-    lines.push("Use `save_command(name, script, description)` to save any of these for quick reuse.");
+    lines.push("Use `bash(command, { save_as: 'name' })` to save any of these for quick reuse.");
   }
 
   return lines.join("\n").trimEnd();
@@ -375,6 +383,7 @@ interface HookConfig {
   hasPostCompactHook: boolean;
   hasPermissions: boolean;
   hasReadTrackingHook: boolean;
+  hasBashTrackingHook: boolean;
 }
 
 function checkHookConfig(root: string): HookConfig {
@@ -415,6 +424,7 @@ function checkHookConfig(root: string): HookConfig {
   let hasPostCompactHook = false;
   let hasPermissions = false;
   let hasReadTrackingHook = false;
+  let hasBashTrackingHook = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
     const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
@@ -441,7 +451,7 @@ function checkHookConfig(root: string): HookConfig {
 
     const localPerms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     const allowed = (Array.isArray(localPerms.allow) ? localPerms.allow : []) as string[];
-    hasPermissions = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
+    hasPermissions = ["mcp__augment-cc__search_file", "mcp__augment-cc__bash"].every(t => allowed.includes(t));
 
     const preToolUse = (Array.isArray(localHooks.PreToolUse) ? localHooks.PreToolUse : []) as unknown[];
     hasReadTrackingHook = preToolUse.some((entry: unknown) => {
@@ -452,9 +462,19 @@ function checkHookConfig(root: string): HookConfig {
         return typeof cmd === "string" && cmd.includes("track-read");
       });
     });
+
+    const postToolUse = (Array.isArray(localHooks.PostToolUse) ? localHooks.PostToolUse : []) as unknown[];
+    hasBashTrackingHook = postToolUse.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && cmd.includes("track-bash");
+      });
+    });
   } catch { /* missing */ }
 
-  return { hasMcp, hasSessionStartHook, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions, hasReadTrackingHook };
+  return { hasMcp, hasSessionStartHook, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions, hasReadTrackingHook, hasBashTrackingHook };
 }
 
 // ── init / upgrade shared config writer ───────────────────────────────────
@@ -534,6 +554,7 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
   const STATIC_RULES_CONTENT = [
     "## augment-cc Tool Rules",
     "- Use **`search_file(path, keyword)`** to locate a function or symbol — returns the relevant section with line numbers. Use those line numbers for a targeted native Read before Edit.",
+    "- Use **`bash(command)`** for shell commands — applies output filtering and tracks usage. Pass `{ save_as: 'name' }` to save for reuse. Use **`run_saved_command(name)`** for saved scripts and **`list_commands()`** to browse them.",
   ].join("\n");
   const STATIC_RULES_BLOCK = `${RULES_START}\n${STATIC_RULES_CONTENT}\n${RULES_END}`;
 
@@ -637,19 +658,52 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [done] SessionStart hooks added (startup + resume) to .claude/settings.local.json");
   }
 
-  // 5. .claude/settings.local.json MCP tool permissions (auto-approve search_file + shell_cached)
-  const MCP_TOOLS = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached"];
+  // 4d. PostToolUse Bash tracking hook — passive command tracking via native Bash
+  if (!Array.isArray(localHooks.PostToolUse)) localHooks.PostToolUse = [];
+  const postToolUseHooks = localHooks.PostToolUse as unknown[];
+
+  const alreadyHasBashTracking = postToolUseHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+    return inner?.some(h => {
+      const cmd = h.command as string | undefined;
+      return typeof cmd === "string" && cmd.includes("track-bash");
+    });
+  });
+
+  if (alreadyHasBashTracking) {
+    results.push("  [skip] Bash tracking hook already configured");
+  } else {
+    postToolUseHooks.push({
+      matcher: "Bash",
+      hooks: [{ type: "command", command: `node ${binPath} track-bash --project-root ${root}` }],
+    });
+    results.push("  [done] PostToolUse Bash tracking hook added to .claude/settings.local.json");
+  }
+
+  // 5. .claude/settings.local.json MCP tool permissions (auto-approve search_file + bash)
+  const MCP_TOOLS = [
+    "mcp__augment-cc__search_file",
+    "mcp__augment-cc__bash",
+    "mcp__augment-cc__run_saved_command",
+    "mcp__augment-cc__list_commands",
+    "mcp__augment-cc__delete_command",
+  ];
   const perms = (localSettings.permissions ?? (localSettings.permissions = {})) as Record<string, unknown>;
   const allowed = (Array.isArray(perms.allow) ? perms.allow : (perms.allow = [])) as string[];
-  // Migrate legacy cache_read permission entry
-  const legacyIdx = (allowed as string[]).indexOf("mcp__augment-cc__cache_read");
-  if (legacyIdx !== -1) { (allowed as string[]).splice(legacyIdx, 1, "mcp__augment-cc__search_file"); }
+  // Migrate legacy permission entries
+  for (const legacy of ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"]) {
+    const idx = (allowed as string[]).indexOf(legacy);
+    if (idx !== -1) (allowed as string[]).splice(idx, 1);
+  }
+  const legacyCacheReadIdx = (allowed as string[]).indexOf("mcp__augment-cc__search_file");
+  if (legacyCacheReadIdx === -1) { /* will be added below */ }
   const newTools = MCP_TOOLS.filter(t => !allowed.includes(t));
   if (newTools.length === 0) {
     results.push("  [skip] MCP tool permissions already configured");
   } else {
     allowed.push(...newTools);
-    results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve search_file, shell_cached)");
+    results.push("  [done] MCP tool permissions added to .claude/settings.local.json (auto-approve search_file, bash + script tools)");
   }
 
   // 6. .claude/settings.local.json PostCompact hook (re-inject context after compaction)
@@ -785,6 +839,25 @@ async function runTrackRead(root: string): Promise<void> {
     initIndexDb();
     recordRead(sessionId, filePath, "tracked");
   } catch { /* never block the Read */ }
+}
+
+// ── track-bash ─────────────────────────────────────────────────────────────
+
+async function runTrackBash(root: string): Promise<void> {
+  // Silent PostToolUse hook — records native Bash commands to command_runs for script library.
+  // No stdout output. Exit 0 always so the Bash proceeds normally.
+  try {
+    let raw = "";
+    for await (const chunk of process.stdin) {
+      raw += chunk as string;
+      if (raw.length > 4 * 1024) break;
+    }
+    const payload = JSON.parse(raw) as { tool_input?: { command?: string } };
+    const command = payload.tool_input?.command;
+    if (!command || command.trim().length === 0) return;
+    initIndexDb();
+    recordCommandRun(root, hashContent(command).slice(0, 16), command);
+  } catch { /* never block */ }
 }
 
 // ── compact-inject ─────────────────────────────────────────────────────────
@@ -928,8 +1001,35 @@ async function runDeactivate(root: string): Promise<void> {
       }
     }
 
+    // Remove PostToolUse Bash tracking hook
+    if (Array.isArray(localHooks.PostToolUse)) {
+      const before = (localHooks.PostToolUse as unknown[]).length;
+      localHooks.PostToolUse = (localHooks.PostToolUse as unknown[]).filter((entry: unknown) => {
+        const e = entry as Record<string, unknown>;
+        const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+        return !inner?.some(h => {
+          const cmd = h.command as string | undefined;
+          return typeof cmd === "string" && cmd.includes("track-bash");
+        });
+      });
+      if ((localHooks.PostToolUse as unknown[]).length < before) {
+        changed = true;
+        results.push("  [done] Removed PostToolUse Bash tracking hook from .claude/settings.local.json");
+      } else {
+        results.push("  [skip] PostToolUse Bash tracking hook not found in .claude/settings.local.json");
+      }
+    }
+
     // Remove MCP permissions
-    const MCP_TOOLS = ["mcp__augment-cc__search_file", "mcp__augment-cc__shell_cached", "mcp__augment-cc__cache_read"];
+    const MCP_TOOLS = [
+      "mcp__augment-cc__search_file",
+      "mcp__augment-cc__bash",
+      "mcp__augment-cc__run_saved_command",
+      "mcp__augment-cc__list_commands",
+      "mcp__augment-cc__delete_command",
+      "mcp__augment-cc__shell_cached",
+      "mcp__augment-cc__cache_read",
+    ];
     const perms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     if (Array.isArray(perms.allow)) {
       const before = perms.allow.length;
@@ -1009,7 +1109,8 @@ function runStatus(root: string): void {
   lines.push(`  Static tool rules (CLAUDE.md):     ${tick(hookConfig.hasStaticRules)} ${hookConfig.hasStaticRules ? "tool rules section present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  Stop hook (settings.json):         ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
   lines.push(`  PostCompact hook (settings.local):  ${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "compact-inject active (targeted re-inject after compaction)" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  MCP permissions (settings.local):   ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "search_file + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Bash tracking hook (settings.local):${tick(hookConfig.hasBashTrackingHook)} ${hookConfig.hasBashTrackingHook ? "passive Bash command tracking active" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP permissions (settings.local):   ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "search_file + bash auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -1025,6 +1126,7 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "post-compact") return runPostCompact();
   if (command === "compact-inject") return runCompactInject(root);
   if (command === "track-read") return runTrackRead(root);
+  if (command === "track-bash") return runTrackBash(root);
   if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
