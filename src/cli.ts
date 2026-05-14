@@ -2,7 +2,7 @@ import { resolve, join, dirname } from "path";
 import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
-import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, recordRead, recordCommandRun, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
+import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, recordRead, recordCommandRun, getAllSavedCommands, getTopCommandRuns, saveHandoff, getLatestHandoff } from "./indexer/db.js";
 import { buildCompactInject } from "./indexer/compact-inject.js";
 import { stats, hashContent } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
@@ -51,8 +51,6 @@ function buildStructuredSummary(facts: TranscriptFacts): string {
   }
   if (facts.commandsRun.length > 0)
     parts.push(`Commands: ${facts.commandsRun.slice(0, 5).join("; ")}.`);
-  if (facts.lastAssistantText)
-    parts.push(`Concluded: "${facts.lastAssistantText.slice(0, 250)}"`);
   return parts.join(" ");
 }
 
@@ -130,30 +128,21 @@ function formatFileTreeBlock(index: ProjectIndex): string {
   return lines.join("\n");
 }
 
-// ── session formatter ──────────────────────────────────────────────────────
+// ── handoff block builder ──────────────────────────────────────────────────
 
-function formatSessions(sessions: SessionEntry[]): string | null {
-  if (sessions.length === 0) return null;
-
-  const lines: string[] = ["## Recent Sessions", ""];
-  for (const s of sessions) {
-    const date = new Date(s.startedAt).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-    const dur = formatDuration(s.durationSecs);
-    const titlePart = s.aiTitle ? ` — ${s.aiTitle}` : "";
-    lines.push(`### ${date} (${dur} on \`${s.branch}\`)${titlePart}`);
-    lines.push(s.summary);
-    if (s.closingNotes.length > 0) {
-      lines.push(`Concluded: "${s.closingNotes[s.closingNotes.length - 1]}"`);
-    }
-    const allFiles = [...s.filesCreated, ...s.filesModified];
-    if (allFiles.length > 0) {
-      const shown = allFiles.slice(0, 8).map(f => f.split("/").pop()).join(", ");
-      const rest = allFiles.length > 8 ? ` [+${allFiles.length - 8} more]` : "";
-      lines.push(`Files: ${shown}${rest}`);
-    }
-    lines.push("");
+function buildHandoffBlock(root: string): string | null {
+  const handoff = getLatestHandoff(root);
+  if (handoff) {
+    const ageMs = Date.now() - handoff.created_at;
+    const ageDays = Math.floor(ageMs / (24 * 3600 * 1000));
+    const ageNote = ageDays >= 3 ? ` (${ageDays}d ago)` : "";
+    return `## Handoff${ageNote}\n${handoff.content}`;
   }
-  return lines.join("\n").trimEnd();
+  const sessions = getRecentSessions(root, 1);
+  if (sessions.length > 0 && sessions[0].firstUserMessage) {
+    return `## Last Session\n"${sessions[0].firstUserMessage.slice(0, 200)}"`;
+  }
+  return null;
 }
 
 // ── CLI commands ───────────────────────────────────────────────────────────
@@ -161,8 +150,7 @@ function formatSessions(sessions: SessionEntry[]): string | null {
 async function runInject(root: string): Promise<void> {
   initIndexDb();
 
-  const recentSessions = getRecentSessions(root, 3);
-  const sessionBlock = formatSessions(recentSessions);
+  const handoffBlock = buildHandoffBlock(root);
 
   let stored = getStoredIndex(root);
 
@@ -180,7 +168,7 @@ async function runInject(root: string): Promise<void> {
   const scriptLibraryBlock = formatScriptLibrary(savedCmds, frequentCmds);
 
   if (!stored) {
-    const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
+    const parts = [handoffBlock, gitBlock, highValueBlock, scriptLibraryBlock, `<!-- augment-cc: no index for ${root} — run: augment-cc refresh -->`].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -197,7 +185,7 @@ async function runInject(root: string): Promise<void> {
   if (!hasMeaningful) {
     const treeBlock = formatFileTreeBlock(index);
     const noSchemaNote = `<!-- augment-cc: no recognized schema/routes detected — explore files directly or run \`augment-cc refresh\` after adding a supported framework -->`;
-    const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, treeBlock, noSchemaNote].filter(Boolean);
+    const parts = [handoffBlock, gitBlock, highValueBlock, scriptLibraryBlock, treeBlock, noSchemaNote].filter(Boolean);
     process.stdout.write(parts.join("\n\n") + "\n");
     return;
   }
@@ -221,7 +209,7 @@ async function runInject(root: string): Promise<void> {
     }
   }
 
-  const parts = [sessionBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, indexBlock].filter(Boolean);
+  const parts = [handoffBlock, gitBlock, highValueBlock, scriptLibraryBlock, auditBlock, indexBlock].filter(Boolean);
   process.stdout.write(parts.join("\n\n") + "\n");
 }
 
@@ -331,26 +319,34 @@ async function runSummarize(): Promise<void> {
   // 5. Summarize via structured extraction
   const summary = buildStructuredSummary(facts);
 
-  // 6. Generate session title: try claude -p, fall back to first user message words
-  let aiTitle: string | null = facts.aiTitle;
-  if (!aiTitle) {
+  // 6. Auto-generate handoff if Claude didn't write one during this session
+  initIndexDb();
+  const latestHandoff = getLatestHandoff(facts.projectRoot);
+  const handoffAlreadyWritten = latestHandoff && latestHandoff.created_at >= facts.startedAt;
+  if (!handoffAlreadyWritten) {
     try {
-      const prompt = `Give a 4-6 word title for this work session. Reply with ONLY the title, no quotes or punctuation at end. Session: ${summary.slice(0, 300)}`;
+      const contextParts = [
+        `Task: ${facts.firstUserMessage.slice(0, 200)}`,
+        facts.closingNotes.length > 0
+          ? `Concluded: "${facts.closingNotes[facts.closingNotes.length - 1].slice(0, 300)}"`
+          : null,
+        [...facts.filesCreated, ...facts.filesModified].length > 0
+          ? `Changed: ${[...facts.filesCreated, ...facts.filesModified].slice(0, 6).map(f => f.split("/").pop()).join(", ")}`
+          : null,
+      ].filter(Boolean).join(". ");
+      const prompt = `Write a 3-5 sentence forward-looking handoff note for the next session. Context: ${contextParts}. Cover: what was in progress, what's next, decisions made, any failed approaches to avoid. Do not describe project structure or schemas. Be specific and concise.`;
       const raw = execSync(`claude -p ${JSON.stringify(prompt)}`, {
         encoding: "utf-8",
-        timeout: 10_000,
+        timeout: 15_000,
         stdio: ["pipe", "pipe", "pipe"],
-      }).trim().replace(/^["']|["']$/g, "");
-      if (raw.length > 0 && raw.length < 80) aiTitle = raw;
-    } catch { /* claude CLI unavailable or timed out */ }
-  }
-  if (!aiTitle && facts.firstUserMessage) {
-    const words = facts.firstUserMessage.trim().split(/\s+/);
-    aiTitle = words.slice(0, 8).join(" ") + (words.length > 8 ? "…" : "");
+      }).trim();
+      if (raw.length > 0 && raw.length < 800) {
+        saveHandoff(facts.projectRoot, raw);
+      }
+    } catch { /* claude CLI unavailable or timed out — skip handoff */ }
   }
 
-  // 7. Persist
-  initIndexDb();
+  // 7. Persist session
   const entry: SessionEntry = {
     sessionId: facts.sessionId,
     projectRoot: facts.projectRoot,
@@ -358,12 +354,13 @@ async function runSummarize(): Promise<void> {
     endedAt: facts.endedAt,
     durationSecs: facts.durationSecs,
     branch: facts.branch,
+    firstUserMessage: facts.firstUserMessage,
     summary,
     filesCreated: facts.filesCreated,
     filesModified: facts.filesModified,
     commandsRun: facts.commandsRun,
     messageCount: facts.messageCount,
-    aiTitle,
+    aiTitle: null,
     closingNotes: facts.closingNotes,
     createdAt: Date.now(),
   };
@@ -555,6 +552,7 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     "## augment-cc Tool Rules",
     "- Use **`search_file(path, keyword)`** to locate a function or symbol — returns the relevant section with line numbers. Use those line numbers for a targeted native Read before Edit.",
     "- Use **`bash(command)`** for shell commands — applies output filtering and tracks usage. Pass `{ save_as: 'name' }` to save for reuse. Use **`run_saved_command(name)`** for saved scripts and **`list_commands()`** to browse them.",
+    "- Before ending a session on in-progress work, call **`write_handoff(content)`** — 3-5 sentences covering what's in progress, next step, decisions made, failed approaches. Injected at the next session start.",
   ].join("\n");
   const STATIC_RULES_BLOCK = `${RULES_START}\n${STATIC_RULES_CONTENT}\n${RULES_END}`;
 
@@ -688,6 +686,7 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     "mcp__augment-cc__run_saved_command",
     "mcp__augment-cc__list_commands",
     "mcp__augment-cc__delete_command",
+    "mcp__augment-cc__write_handoff",
   ];
   const perms = (localSettings.permissions ?? (localSettings.permissions = {})) as Record<string, unknown>;
   const allowed = (Array.isArray(perms.allow) ? perms.allow : (perms.allow = [])) as string[];
@@ -1027,6 +1026,7 @@ async function runDeactivate(root: string): Promise<void> {
       "mcp__augment-cc__run_saved_command",
       "mcp__augment-cc__list_commands",
       "mcp__augment-cc__delete_command",
+      "mcp__augment-cc__write_handoff",
       "mcp__augment-cc__shell_cached",
       "mcp__augment-cc__cache_read",
     ];

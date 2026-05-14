@@ -6,6 +6,7 @@ import { cache_read } from "./tools/search_file.js";
 import { bash_exec } from "./tools/bash_exec.js";
 import { run_saved_command } from "./tools/run_saved_command.js";
 import { list_commands } from "./tools/list_commands.js";
+import { write_handoff } from "./tools/write_handoff.js";
 import { stats as _stats } from "./cache.js";
 import { IndexerService, getProjectIndex } from "./indexer/index.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
@@ -99,6 +100,17 @@ server.tool(
       : `[augment-cc: no saved command "${name}" found]`;
     return { content: [{ type: "text", text: msg }] };
   }
+);
+
+server.tool(
+  "write_handoff",
+  "Save a forward-looking handoff note for the next session — what's in progress, what's next, decisions made, failed approaches to avoid. Called when you want to explicitly prepare context for the next session. Auto-generated at session end if not called.",
+  {
+    content: z.string().describe("3-5 sentence handoff note. Cover: what task is in progress, what's partially done or broken, what the next step is, decisions made and why, any failed approaches to avoid. Do not describe project structure or schemas — those are already available."),
+  },
+  async ({ content }) => ({
+    content: [{ type: "text", text: await write_handoff({ content, _projectRoot: process.cwd() }) }],
+  })
 );
 
 server.resource(

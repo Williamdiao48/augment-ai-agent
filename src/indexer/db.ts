@@ -106,6 +106,18 @@ export function initIndexDb(): void {
   try {
     getDb().prepare("ALTER TABLE saved_commands ADD COLUMN last_failed_at INTEGER").run();
   } catch { /* column already exists */ }
+
+  // Phase 29: handoff table and first_user_message migration
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS handoffs (
+      project_root  TEXT PRIMARY KEY,
+      content       TEXT NOT NULL,
+      created_at    INTEGER NOT NULL
+    );
+  `);
+  try {
+    getDb().prepare("ALTER TABLE sessions ADD COLUMN first_user_message TEXT").run();
+  } catch { /* column already exists */ }
 }
 
 export function getStoredIndex(projectRoot: string): { index_json: string; index_md: string; built_at: number } | null {
@@ -152,8 +164,8 @@ export function saveSession(entry: SessionEntry): void {
       INSERT OR REPLACE INTO sessions
         (session_id, project_root, started_at, ended_at, duration_secs,
          branch, summary, files_created, files_modified, commands_run,
-         message_count, ai_title, closing_notes, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         message_count, ai_title, closing_notes, created_at, first_user_message)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
     .run(
       entry.sessionId,
@@ -170,6 +182,7 @@ export function saveSession(entry: SessionEntry): void {
       entry.aiTitle ?? null,
       JSON.stringify(entry.closingNotes),
       entry.createdAt,
+      entry.firstUserMessage ?? null,
     );
   pruneOldSessions(entry.projectRoot, MAX_SESSIONS);
 }
@@ -180,12 +193,13 @@ export function getRecentSessions(projectRoot: string, limit: number): SessionEn
     duration_secs: number; branch: string; summary: string; files_created: string;
     files_modified: string; commands_run: string; message_count: number;
     ai_title: string | null; closing_notes: string; created_at: number;
+    first_user_message: string | null;
   };
   const rows = getDb()
     .prepare(`
       SELECT session_id, project_root, started_at, ended_at, duration_secs,
              branch, summary, files_created, files_modified, commands_run,
-             message_count, ai_title, closing_notes, created_at
+             message_count, ai_title, closing_notes, created_at, first_user_message
       FROM sessions WHERE project_root = ?
       ORDER BY started_at DESC LIMIT ?
     `)
@@ -206,6 +220,7 @@ export function getRecentSessions(projectRoot: string, limit: number): SessionEn
     aiTitle: r.ai_title,
     closingNotes: safeJsonParse(r.closing_notes),
     createdAt: r.created_at,
+    firstUserMessage: r.first_user_message ?? "",
   }));
 }
 
@@ -409,4 +424,25 @@ export function pruneOldCommandRuns(maxAgeMs: number = 30 * 24 * 3600 * 1000): v
   getDb()
     .prepare("DELETE FROM command_runs WHERE last_run_at < ?")
     .run(Date.now() - maxAgeMs);
+}
+
+// ── Phase 29: handoffs ─────────────────────────────────────────────────────
+
+export function saveHandoff(projectRoot: string, content: string): void {
+  getDb()
+    .prepare(`
+      INSERT INTO handoffs (project_root, content, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(project_root) DO UPDATE SET
+        content = excluded.content,
+        created_at = excluded.created_at
+    `)
+    .run(projectRoot, content, Date.now());
+}
+
+export function getLatestHandoff(projectRoot: string): { content: string; created_at: number } | null {
+  type Row = { content: string; created_at: number };
+  return (getDb()
+    .prepare("SELECT content, created_at FROM handoffs WHERE project_root = ?")
+    .get(projectRoot) as Row | undefined) ?? null;
 }

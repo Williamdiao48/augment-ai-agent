@@ -220,6 +220,7 @@ export interface SessionEntry {
   endedAt: number;
   durationSecs: number;
   branch: string;
+  firstUserMessage: string;
   summary: string;
   filesCreated: string[];
   filesModified: string[];
