@@ -3,6 +3,7 @@ import os from "os";
 import { realpathSync, readFileSync, writeFileSync, mkdirSync } from "fs";
 import { execSync } from "child_process";
 import { initIndexDb, getStoredIndex, getRecentSessions, saveSession, getTopReadFiles, saveAudit, getStoredAudit, recordCompaction, getAllSavedCommands, getTopCommandRuns } from "./indexer/db.js";
+import { buildCompactInject } from "./indexer/compact-inject.js";
 import { stats } from "./cache.js";
 import { getGitState, formatGitState } from "./indexer/git.js";
 import { rebuildProjectIndex } from "./indexer/index.js";
@@ -368,7 +369,7 @@ async function runSummarize(): Promise<void> {
 
 interface HookConfig {
   hasMcp: boolean;
-  hasClaudeMd: boolean;
+  hasSessionStartHook: boolean;
   hasStaticRules: boolean;
   hasStopHook: boolean;
   hasPostCompactHook: boolean;
@@ -384,12 +385,10 @@ function checkHookConfig(root: string): HookConfig {
     hasMcp = "augment-cc" in servers;
   } catch { /* missing or unreadable */ }
 
-  // CLAUDE.md
-  let hasClaudeMd = false;
+  // CLAUDE.md static rules
   let hasStaticRules = false;
   try {
     const md = readFileSync(join(root, "CLAUDE.md"), "utf-8");
-    hasClaudeMd = md.includes("augment-cc inject") || md.includes("dist/index.js inject");
     hasStaticRules = md.includes("<!-- augment-cc:rules:start -->");
   } catch { /* missing */ }
 
@@ -410,12 +409,24 @@ function checkHookConfig(root: string): HookConfig {
     });
   } catch { /* missing */ }
 
-  // .claude/settings.local.json PostCompact hook + MCP permissions
+  // .claude/settings.local.json SessionStart + PostCompact hooks + MCP permissions
+  let hasSessionStartHook = false;
   let hasPostCompactHook = false;
   let hasPermissions = false;
   try {
     const localSettings = JSON.parse(readFileSync(join(root, ".claude", "settings.local.json"), "utf-8")) as Record<string, unknown>;
     const localHooks = (localSettings.hooks ?? {}) as Record<string, unknown>;
+
+    const sessionStartHooks = (Array.isArray(localHooks.SessionStart) ? localHooks.SessionStart : []) as unknown[];
+    hasSessionStartHook = sessionStartHooks.some((entry: unknown) => {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      return inner?.some(h => {
+        const cmd = h.command as string | undefined;
+        return typeof cmd === "string" && (cmd.includes("augment-cc inject") || (cmd.includes("dist/index.js") && cmd.includes("inject")));
+      });
+    });
+
     const postHooks = (Array.isArray(localHooks.PostCompact) ? localHooks.PostCompact : []) as unknown[];
     hasPostCompactHook = postHooks.some((entry: unknown) => {
       const e = entry as Record<string, unknown>;
@@ -425,12 +436,13 @@ function checkHookConfig(root: string): HookConfig {
         return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
       });
     });
+
     const localPerms = (localSettings.permissions ?? {}) as Record<string, unknown>;
     const allowed = (Array.isArray(localPerms.allow) ? localPerms.allow : []) as string[];
     hasPermissions = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"].every(t => allowed.includes(t));
   } catch { /* missing */ }
 
-  return { hasMcp, hasClaudeMd, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions };
+  return { hasMcp, hasSessionStartHook, hasStaticRules, hasStopHook, hasPostCompactHook, hasPermissions };
 }
 
 // ── init / upgrade shared config writer ───────────────────────────────────
@@ -457,24 +469,22 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push(`  [done] .mcp.json ${mcpExists ? "updated" : "created"}`);
   }
 
-  // 2. CLAUDE.md
+  // 2. CLAUDE.md — remove legacy ! inject line (inject is now a SessionStart hook)
   const claudeMdPath = join(root, "CLAUDE.md");
-  const injectLine = `!node ${binPath} inject --project-root $PWD`;
-  let claudeMdExists = false;
   let claudeMdContent = "";
-  try {
-    claudeMdContent = readFileSync(claudeMdPath, "utf-8");
-    claudeMdExists = true;
-  } catch { /* will create */ }
+  try { claudeMdContent = readFileSync(claudeMdPath, "utf-8"); } catch { /* will be created by static rules step */ }
 
   if (claudeMdContent.includes("augment-cc inject") || claudeMdContent.includes("dist/index.js inject")) {
-    results.push("  [skip] CLAUDE.md already configured");
-  } else if (claudeMdExists) {
-    writeFileSync(claudeMdPath, injectLine + "\n\n" + claudeMdContent);
-    results.push("  [done] CLAUDE.md updated (inject line prepended)");
+    const stripped = claudeMdContent
+      .split("\n")
+      .filter(l => !l.includes("augment-cc inject") && !l.includes("dist/index.js inject"))
+      .join("\n")
+      .replace(/^\n+/, "");
+    writeFileSync(claudeMdPath, stripped);
+    claudeMdContent = stripped;
+    results.push("  [done] CLAUDE.md: removed legacy ! inject line (now a SessionStart hook)");
   } else {
-    writeFileSync(claudeMdPath, injectLine + "\n");
-    results.push("  [done] CLAUDE.md created");
+    results.push("  [skip] CLAUDE.md: no legacy inject line");
   }
 
   // 3. ~/.claude/settings.json Stop hook
@@ -569,6 +579,33 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
     results.push("  [skip] No PreToolUse hooks configured");
   }
 
+  // 4b. SessionStart hooks (startup + resume) — inject on new session and resume
+  if (!Array.isArray(localHooks.SessionStart)) localHooks.SessionStart = [];
+  const sessionStartHooks = localHooks.SessionStart as unknown[];
+
+  const alreadyHasSessionStart = sessionStartHooks.some((entry: unknown) => {
+    const e = entry as Record<string, unknown>;
+    const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+    return inner?.some(h => {
+      const cmd = h.command as string | undefined;
+      return typeof cmd === "string" && (cmd.includes("augment-cc inject") || (cmd.includes("dist/index.js") && cmd.includes("inject")));
+    });
+  });
+
+  if (alreadyHasSessionStart) {
+    results.push("  [skip] SessionStart inject hooks already configured");
+  } else {
+    sessionStartHooks.push({
+      matcher: "startup",
+      hooks: [{ type: "command", command: `node ${binPath} inject --project-root ${root}` }],
+    });
+    sessionStartHooks.push({
+      matcher: "resume",
+      hooks: [{ type: "command", command: `node ${binPath} inject --project-root ${root}` }],
+    });
+    results.push("  [done] SessionStart hooks added (startup + resume) to .claude/settings.local.json");
+  }
+
   // 5. .claude/settings.local.json MCP tool permissions (auto-approve cache_read + shell_cached)
   const MCP_TOOLS = ["mcp__augment-cc__cache_read", "mcp__augment-cc__shell_cached"];
   const perms = (localSettings.permissions ?? (localSettings.permissions = {})) as Record<string, unknown>;
@@ -584,24 +621,44 @@ async function writeHookConfig(root: string, binPath: string): Promise<string[]>
   // 6. .claude/settings.local.json PostCompact hook (re-inject context after compaction)
   if (!Array.isArray(localHooks.PostCompact)) localHooks.PostCompact = [];
   const postCompactHooks = localHooks.PostCompact as unknown[];
+  const compactInjectCmd = `node ${binPath} compact-inject --project-root ${root}`;
 
-  const alreadyHasPostCompactHook = postCompactHooks.some((entry: unknown) => {
+  const alreadyHasCompactInject = postCompactHooks.some((entry: unknown) => {
     const e = entry as Record<string, unknown>;
     const inner = e.hooks as Array<Record<string, unknown>> | undefined;
     return inner?.some(h => {
       const cmd = h.command as string | undefined;
-      return typeof cmd === "string" && (cmd.includes("augment-cc") || cmd.includes("dist/index.js"));
+      return typeof cmd === "string" && cmd.includes("compact-inject");
     });
   });
 
-  if (alreadyHasPostCompactHook) {
-    results.push("  [skip] PostCompact hook already configured");
+  if (alreadyHasCompactInject) {
+    results.push("  [skip] PostCompact hook already configured (compact-inject)");
   } else {
-    postCompactHooks.push({
-      matcher: "",
-      hooks: [{ type: "command", command: `node ${binPath} post-compact` }],
-    });
-    results.push("  [done] PostCompact hook added to .claude/settings.local.json (re-inject context after compaction)");
+    // Migrate legacy post-compact → compact-inject in place, or add fresh
+    let migrated = false;
+    for (const entry of postCompactHooks) {
+      const e = entry as Record<string, unknown>;
+      const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+      if (inner) {
+        for (const h of inner) {
+          const cmd = h.command as string | undefined;
+          if (typeof cmd === "string" && cmd.includes("post-compact")) {
+            h.command = compactInjectCmd;
+            migrated = true;
+          }
+        }
+      }
+    }
+    if (migrated) {
+      results.push("  [done] PostCompact hook migrated from post-compact to compact-inject");
+    } else {
+      postCompactHooks.push({
+        matcher: "",
+        hooks: [{ type: "command", command: compactInjectCmd }],
+      });
+      results.push("  [done] PostCompact hook added to .claude/settings.local.json (targeted re-inject after compaction)");
+    }
   }
 
   mkdirSync(localSettingsDir, { recursive: true });
@@ -674,6 +731,25 @@ async function runPostCompact(): Promise<void> {
   initIndexDb();
   recordCompaction(root);
   await runInject(root);
+}
+
+// ── compact-inject ─────────────────────────────────────────────────────────
+
+async function runCompactInject(root: string): Promise<void> {
+  initIndexDb();
+  recordCompaction(root);
+
+  process.stdout.write("[augment-cc: compaction detected — re-injecting targeted context]\n\n");
+
+  const targeted = await buildCompactInject(root);
+
+  if (!targeted) {
+    // No session_reads data (Claude not using cache_read) — fall back to full inject
+    process.stderr.write("augment-cc: no session activity data, falling back to full inject\n");
+    return runInject(root);
+  }
+
+  process.stdout.write(targeted + "\n");
 }
 
 // ── deactivate ─────────────────────────────────────────────────────────────
@@ -767,6 +843,25 @@ async function runDeactivate(root: string): Promise<void> {
         results.push("  [done] Removed PreToolUse Read hook from .claude/settings.local.json");
       } else {
         results.push("  [skip] PreToolUse Read hook not found in .claude/settings.local.json");
+      }
+    }
+
+    // Remove SessionStart hooks
+    if (Array.isArray(localHooks.SessionStart)) {
+      const before = (localHooks.SessionStart as unknown[]).length;
+      localHooks.SessionStart = (localHooks.SessionStart as unknown[]).filter((entry: unknown) => {
+        const e = entry as Record<string, unknown>;
+        const inner = e.hooks as Array<Record<string, unknown>> | undefined;
+        return !inner?.some(h => {
+          const cmd = h.command as string | undefined;
+          return typeof cmd === "string" && (cmd.includes("augment-cc inject") || (cmd.includes("dist/index.js") && cmd.includes("inject")));
+        });
+      });
+      if ((localHooks.SessionStart as unknown[]).length < before) {
+        changed = true;
+        results.push("  [done] Removed SessionStart inject hooks from .claude/settings.local.json");
+      } else {
+        results.push("  [skip] SessionStart inject hooks not found in .claude/settings.local.json");
       }
     }
 
@@ -864,12 +959,12 @@ function runStatus(root: string): void {
   // Hooks
   lines.push("Hooks");
   const tick = (ok: boolean) => ok ? "✓" : "✗";
-  lines.push(`  MCP server (.mcp.json):          ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  Inject hook (CLAUDE.md):         ${tick(hookConfig.hasClaudeMd)} ${hookConfig.hasClaudeMd ? "inject line present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  Static tool rules (CLAUDE.md):   ${tick(hookConfig.hasStaticRules)} ${hookConfig.hasStaticRules ? "tool rules section present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  Stop hook (settings.json):       ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  PostCompact hook (settings.local):${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "re-inject active (fires after every compaction)" : "not found — run augment-cc upgrade"}`);
-  lines.push(`  MCP permissions (settings.local): ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP server (.mcp.json):            ${tick(hookConfig.hasMcp)} ${hookConfig.hasMcp ? "augment-cc configured" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  SessionStart hook (settings.local): ${tick(hookConfig.hasSessionStartHook)} ${hookConfig.hasSessionStartHook ? "inject on startup + resume" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Static tool rules (CLAUDE.md):     ${tick(hookConfig.hasStaticRules)} ${hookConfig.hasStaticRules ? "tool rules section present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  Stop hook (settings.json):         ${tick(hookConfig.hasStopHook)} ${hookConfig.hasStopHook ? "augment-cc summarize present" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  PostCompact hook (settings.local):  ${tick(hookConfig.hasPostCompactHook)} ${hookConfig.hasPostCompactHook ? "compact-inject active (targeted re-inject after compaction)" : "not found — run augment-cc upgrade"}`);
+  lines.push(`  MCP permissions (settings.local):   ${tick(hookConfig.hasPermissions)} ${hookConfig.hasPermissions ? "cache_read + shell_cached auto-approved" : "not found — run augment-cc upgrade"}`);
 
   process.stdout.write(lines.join("\n") + "\n");
 }
@@ -883,6 +978,7 @@ export async function runCli(argv: string[]): Promise<void> {
   if (command === "upgrade") return runUpgrade(root);
   if (command === "deactivate") return runDeactivate(root);
   if (command === "post-compact") return runPostCompact();
+  if (command === "compact-inject") return runCompactInject(root);
   if (command === "audit") return runAudit(root);
   if (command === "inject") return runInject(root);
   if (command === "refresh") return runRefresh(root);
@@ -906,12 +1002,12 @@ export async function runCli(argv: string[]): Promise<void> {
     "  upgrade       Re-apply latest hook config without rebuilding the index (run after git pull)",
     "  deactivate    Remove augment-cc hooks from the current project (re-activate with init)",
     "  audit         Analyze codebase for oversized files, duplicate function names, and dumping-ground files",
-    "  inject        Print context injection block (used by CLAUDE.md hook)",
-    "  refresh       Force-rebuild the project index",
-    "  summarize     Parse session transcript and save summary (used by Stop hook)",
-    "  status        Show cache stats, session history, and hook configuration",
-    "  redirect-read Output PreToolUse reminder (used by .claude/settings.local.json hook)",
-    "  post-compact  Re-inject project context after compaction (used by PostCompact hook)",
+    "  inject         Print full context injection block (used by SessionStart hook)",
+    "  compact-inject Print targeted post-compact context block (used by PostCompact hook)",
+    "  refresh        Force-rebuild the project index",
+    "  summarize      Parse session transcript and save summary (used by Stop hook)",
+    "  status         Show cache stats, session history, and hook configuration",
+    "  post-compact   Legacy: full re-inject after compaction (superseded by compact-inject)",
     "",
   ].join("\n"));
   process.exit(1);

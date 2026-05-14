@@ -270,6 +270,25 @@ export function pruneOldSessionReads(maxAgeMs: number = 48 * 3600 * 1000): void 
     .run(Date.now() - maxAgeMs);
 }
 
+export function getReadsSinceCompaction(
+  projectRoot: string,
+  since: number,
+  limit: number = 15,
+): Array<{ file_path: string; read_count: number }> {
+  type Row = { file_path: string; read_count: number };
+  return getDb()
+    .prepare(`
+      SELECT file_path, SUM(read_count) AS read_count
+      FROM session_reads
+      WHERE first_read_at > ?
+        AND file_path LIKE ?
+      GROUP BY file_path
+      ORDER BY read_count DESC
+      LIMIT ?
+    `)
+    .all(since, `${projectRoot}/%`, limit) as Row[];
+}
+
 export function saveAudit(projectRoot: string, auditJson: string, auditMd: string): void {
   getDb()
     .prepare("UPDATE project_index SET audit_json = ?, audit_md = ?, audited_at = ? WHERE project_root = ?")
