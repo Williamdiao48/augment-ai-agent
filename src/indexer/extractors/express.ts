@@ -18,18 +18,33 @@ export function extractExpress(content: string, sourceFile: string): ExpressRout
     routerVars.add(m[1]);
   }
 
+  // First pass: collect prefix mounts — app.use('/prefix', routerVar)
+  // Cross-file mounting (router defined elsewhere) is not resolved here.
+  const prefixMap = new Map<string, string>(); // routerVar → prefix
+  const mountRe = /(\w+)\.use\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(\w+)/g;
+  while ((m = mountRe.exec(cleaned)) !== null) {
+    const subRouter = m[3];
+    const prefix = m[2];
+    if (routerVars.has(subRouter)) {
+      prefixMap.set(subRouter, prefix);
+    }
+  }
+
+  // Second pass: extract routes, capturing the var name for prefix resolution
+  // Excludes `use` — those are middleware/mounts, not routes
   const varsPattern = [...routerVars].join("|");
   const routeRe = new RegExp(
-    `(?:${varsPattern})\\.(get|post|put|delete|patch|all|use)\\s*\\(\\s*(['"\`])([^'"\`]+)\\2`,
+    `(${varsPattern})\\.(get|post|put|delete|patch|all)\\s*\\(\\s*(['"\`])([^'"\`]+)\\3`,
     "gm"
   );
 
   while ((m = routeRe.exec(cleaned)) !== null) {
-    routes.push({
-      method: m[1].toUpperCase(),
-      path: m[3],
-      sourceFile,
-    });
+    const varName = m[1];
+    const method = m[2].toUpperCase();
+    const rawPath = m[4];
+    const prefix = prefixMap.get(varName) ?? "";
+    const path = prefix ? `${prefix}${rawPath}` : rawPath;
+    routes.push({ method, path, sourceFile });
   }
 
   return routes;
