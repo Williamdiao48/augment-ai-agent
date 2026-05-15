@@ -326,7 +326,8 @@ async function runSummarize(): Promise<void> {
   initIndexDb();
   const latestHandoff = getLatestHandoff(facts.projectRoot);
   const handoffAlreadyWritten = latestHandoff && latestHandoff.created_at >= facts.startedAt;
-  if (!handoffAlreadyWritten) {
+  const richEnoughForAutoHandoff = facts.durationSecs >= 120 && facts.messageCount >= 5;
+  if (!handoffAlreadyWritten && richEnoughForAutoHandoff) {
     try {
       const contextParts = [
         `Task: ${facts.firstUserMessage.slice(0, 200)}`,
