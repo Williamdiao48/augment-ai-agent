@@ -216,6 +216,9 @@ async function runInject(root: string): Promise<void> {
 async function runRefresh(root: string): Promise<void> {
   process.stderr.write(`augment-cc: rebuilding index for ${root}...\n`);
   await rebuildProjectIndex(root);
+  const { runCodeAudit } = await import("./indexer/audit.js");
+  const auditResult = await runCodeAudit(root);
+  if (auditResult) saveAudit(root, JSON.stringify(auditResult.result), auditResult.md ?? "");
   process.stderr.write("augment-cc: done.\n");
 }
 
